@@ -183,3 +183,8 @@ pub fn cache_dir() -> Option<std::path::PathBuf> {
 pub fn cache_dir() -> Option<std::path::PathBuf> {
 	self::unix::home_dir().map(|h| h.join("Library/Caches").join(PYKE_ROOT))
 }
+
+#[cfg(target_os = "android")]
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from("/data/local/tmp/cache"))
+}
