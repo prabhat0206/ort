@@ -188,3 +188,8 @@ pub fn cache_dir() -> Option<std::path::PathBuf> {
 pub fn cache_dir() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from("/data/local/tmp/cache"))
 }
+
+#[cfg(target_os = "ios")]
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+	Some(std::path::PathBuf::from("/private/var/mobile/Containers/Data/Application"))
+}
