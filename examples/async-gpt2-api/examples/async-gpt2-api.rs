@@ -10,15 +10,14 @@ use axum::{
 	routing::post
 };
 use futures::Stream;
-use ndarray::{Array1, ArrayViewD, Axis, array, concatenate, s};
 use ort::{
 	execution_providers::CUDAExecutionProvider,
-	inputs,
-	session::{Session, builder::GraphOptimizationLevel}
+	session::{Session, builder::GraphOptimizationLevel},
+	value::TensorRef
 };
 use rand::Rng;
 use tokenizers::Tokenizer;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -39,13 +38,13 @@ async fn main() -> anyhow::Result<()> {
 	let session = Session::builder()?
 		.with_optimization_level(GraphOptimizationLevel::Level1)?
 		.with_intra_threads(4)?
-		.commit_from_url("https://parcel.pyke.io/v2/cdn/assetdelivery/ortrsv2/ex_models/gpt2.onnx")?;
+		.commit_from_url("https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/gpt2.onnx")?;
 
 	// Load the tokenizer and encode the prompt into a sequence of tokens.
 	let tokenizer = Tokenizer::from_file(Path::new(env!("CARGO_MANIFEST_DIR")).join("data").join("tokenizer.json")).unwrap();
 
 	let app_state = AppState {
-		session: Arc::new(session),
+		session: Arc::new(Mutex::new(session)),
 		tokenizer: Arc::new(tokenizer)
 	};
 
@@ -60,44 +59,47 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct AppState {
-	session: Arc<Session>,
+	session: Arc<Mutex<Session>>,
 	tokenizer: Arc<Tokenizer>
 }
 
-fn generate_stream(tokenizer: Arc<Tokenizer>, session: Arc<Session>, tokens: Vec<i64>, gen_tokens: usize) -> impl Stream<Item = ort::Result<Event>> + Send {
-	async_stream::try_stream! {
-		let mut tokens = Array1::from_iter(tokens.iter().cloned());
-
+fn generate_stream(
+	tokenizer: Arc<Tokenizer>,
+	session: Arc<Mutex<Session>>,
+	mut tokens: Vec<i64>,
+	gen_tokens: usize
+) -> impl Stream<Item = ort::Result<Event>> + Send {
+	async_stream_lite::try_async_stream(|yielder| async move {
 		for _ in 0..gen_tokens {
-			let array = tokens.view().insert_axis(Axis(0)).insert_axis(Axis(1));
-			let outputs = session.run_async(inputs![array]?)?.await?;
-			let generated_tokens: ArrayViewD<f32> = outputs["output1"].try_extract_tensor()?;
+			let input = TensorRef::from_array_view((vec![1, 1, tokens.len() as i64], tokens.as_slice()))?;
+			let probabilities = {
+				let mut session = session.lock().await;
+				let outputs = session.run_async(ort::inputs![input])?.await?;
+				let (dim, probabilities) = outputs["output1"].try_extract_raw_tensor()?;
 
-			// Collect and sort logits
-			let probabilities = &mut generated_tokens
-				.slice(s![0, 0, -1, ..])
-				.insert_axis(Axis(0))
-				.to_owned()
-				.iter()
-				.cloned()
-				.enumerate()
-				.collect::<Vec<_>>();
-			probabilities.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
+				// Collect and sort logits
+				let (seq_len, vocab_size) = (dim[2] as usize, dim[3] as usize);
+				let mut probabilities: Vec<(usize, f32)> = probabilities[(seq_len - 1) * vocab_size..].iter().copied().enumerate().collect();
+				probabilities.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
+				probabilities
+			};
 
 			// Sample using top-k sampling
 			let token = {
 				let mut rng = rand::thread_rng();
-				probabilities[rng.gen_range(0..=5)].0
+				probabilities[rng.gen_range(0..=5)].0 as i64
 			};
-			tokens = concatenate![Axis(0), tokens, array![token.try_into().unwrap()]];
+			tokens.push(token);
 
 			let token_str = tokenizer.decode(&[token as _], true).unwrap();
-			yield Event::default().data(token_str);
+			yielder.r#yield(Event::default().data(token_str)).await;
 		}
-	}
+
+		Ok(())
+	})
 }
 
-impl FromRef<AppState> for Arc<Session> {
+impl FromRef<AppState> for Arc<Mutex<Session>> {
 	fn from_ref(input: &AppState) -> Self {
 		Arc::clone(&input.session)
 	}
@@ -108,6 +110,6 @@ impl FromRef<AppState> for Arc<Tokenizer> {
 	}
 }
 
-async fn generate(State(session): State<Arc<Session>>, State(tokenizer): State<Arc<Tokenizer>>) -> Sse<impl Stream<Item = ort::Result<Event>>> {
+async fn generate(State(session): State<Arc<Mutex<Session>>>, State(tokenizer): State<Arc<Tokenizer>>) -> Sse<impl Stream<Item = ort::Result<Event>>> {
 	Sse::new(generate_stream(tokenizer, session, vec![0], 50)).keep_alive(KeepAlive::new())
 }

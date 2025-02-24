@@ -1,8 +1,15 @@
-use std::{
+use alloc::{
+	boxed::Box,
+	format,
+	string::{String, ToString},
+	sync::Arc,
+	vec::Vec
+};
+use core::{
 	fmt::Debug,
 	marker::PhantomData,
-	ptr::{self, NonNull},
-	sync::Arc
+	mem,
+	ptr::{self, NonNull}
 };
 
 use super::{DowncastableTarget, Value, ValueInner, ValueRef, ValueRefMut, ValueType, ValueTypeMarker};
@@ -14,7 +21,7 @@ use crate::{
 };
 
 pub trait SequenceValueTypeMarker: ValueTypeMarker {
-	crate::private_trait!();
+	private_trait!();
 }
 
 #[derive(Debug)]
@@ -24,10 +31,10 @@ impl ValueTypeMarker for DynSequenceValueType {
 		"DynSequence".to_string()
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 impl SequenceValueTypeMarker for DynSequenceValueType {
-	crate::private_impl!();
+	private_impl!();
 }
 
 impl DowncastableTarget for DynSequenceValueType {
@@ -35,7 +42,7 @@ impl DowncastableTarget for DynSequenceValueType {
 		matches!(dtype, ValueType::Sequence { .. })
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 
 #[derive(Debug)]
@@ -45,10 +52,10 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + ?Sized> ValueTypeMarker f
 		format!("Sequence<{}>", T::format())
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 impl<T: ValueTypeMarker + DowncastableTarget + Debug + ?Sized> SequenceValueTypeMarker for SequenceValueType<T> {
-	crate::private_impl!();
+	private_impl!();
 }
 
 impl<T: ValueTypeMarker + DowncastableTarget + Debug + ?Sized> DowncastableTarget for SequenceValueType<T> {
@@ -59,7 +66,7 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + ?Sized> DowncastableTarge
 		}
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 
 pub type DynSequence = Value<DynSequenceValueType>;
@@ -74,7 +81,7 @@ impl<Type: SequenceValueTypeMarker + Sized> Value<Type> {
 	pub fn try_extract_sequence<OtherType: ValueTypeMarker + DowncastableTarget + Debug + Sized>(
 		&self,
 		allocator: &Allocator
-	) -> Result<Vec<Value<OtherType>>> {
+	) -> Result<Vec<ValueRef<'_, OtherType>>> {
 		match self.dtype() {
 			ValueType::Sequence(_) => {
 				let mut len = 0;
@@ -85,7 +92,9 @@ impl<Type: SequenceValueTypeMarker + Sized> Value<Type> {
 					let mut value_ptr = ptr::null_mut();
 					ortsys![unsafe GetValue(self.ptr(), i as _, allocator.ptr().cast_mut(), &mut value_ptr)?; nonNull(value_ptr)];
 
-					let value = unsafe { Value::from_ptr(NonNull::new_unchecked(value_ptr), None) };
+					let mut value = ValueRef::new(unsafe { Value::from_ptr(NonNull::new_unchecked(value_ptr), None) });
+					value.upgradable = false;
+
 					let value_type = value.dtype();
 					if !OtherType::can_downcast(value.dtype()) {
 						return Err(Error::new_with_code(
@@ -149,14 +158,14 @@ impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized + 'static> Value<Se
 }
 
 impl<T: ValueTypeMarker + DowncastableTarget + Debug + Sized> Value<SequenceValueType<T>> {
-	pub fn extract_sequence(&self, allocator: &Allocator) -> Vec<Value<T>> {
+	pub fn extract_sequence(&self, allocator: &Allocator) -> Vec<ValueRef<'_, T>> {
 		self.try_extract_sequence(allocator).expect("Failed to extract sequence")
 	}
 
 	/// Converts from a strongly-typed [`Sequence<T>`] to a type-erased [`DynSequence`].
 	#[inline]
 	pub fn upcast(self) -> DynSequence {
-		unsafe { std::mem::transmute(self) }
+		unsafe { mem::transmute(self) }
 	}
 
 	/// Converts from a strongly-typed [`Sequence<T>`] to a reference to a type-erased [`DynSequence`].

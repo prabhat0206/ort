@@ -16,14 +16,19 @@
 //!
 //! ONNX Runtime also supports [`Sequence`]s and [`Map`]s, though they are less commonly used.
 
-use std::{
+use alloc::{
+	boxed::Box,
+	format,
+	string::{String, ToString},
+	sync::Arc
+};
+use core::{
 	any::Any,
 	fmt::Debug,
 	marker::PhantomData,
 	mem::transmute,
 	ops::{Deref, DerefMut},
-	ptr::NonNull,
-	sync::Arc
+	ptr::{self, NonNull}
 };
 
 mod impl_map;
@@ -36,7 +41,10 @@ pub use self::{
 	impl_sequence::{
 		DynSequence, DynSequenceRef, DynSequenceRefMut, DynSequenceValueType, Sequence, SequenceRef, SequenceRefMut, SequenceValueType, SequenceValueTypeMarker
 	},
-	impl_tensor::{DynTensor, DynTensorRef, DynTensorRefMut, DynTensorValueType, Tensor, TensorRef, TensorRefMut, TensorValueType, TensorValueTypeMarker},
+	impl_tensor::{
+		DynTensor, DynTensorRef, DynTensorRefMut, DynTensorValueType, OwnedTensorArrayData, Tensor, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts,
+		TensorRef, TensorRefMut, TensorValueType, TensorValueTypeMarker, ToDimensions
+	},
 	r#type::ValueType
 };
 use crate::{
@@ -67,7 +75,7 @@ impl AsPointer for ValueInner {
 impl Drop for ValueInner {
 	fn drop(&mut self) {
 		let ptr = self.ptr_mut();
-		tracing::trace!("dropping value at {ptr:p}");
+		crate::trace!("dropping value at {ptr:p}");
 		if self.drop {
 			ortsys![unsafe ReleaseValue(ptr)];
 		}
@@ -78,12 +86,19 @@ impl Drop for ValueInner {
 #[derive(Debug)]
 pub struct ValueRef<'v, Type: ValueTypeMarker + ?Sized = DynValueTypeMarker> {
 	inner: Value<Type>,
+	pub(crate) upgradable: bool,
 	lifetime: PhantomData<&'v ()>
 }
 
 impl<'v, Type: ValueTypeMarker + ?Sized> ValueRef<'v, Type> {
 	pub(crate) fn new(inner: Value<Type>) -> Self {
-		ValueRef { inner, lifetime: PhantomData }
+		ValueRef {
+			// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
+			// duration of the kernel, allowing an upgrade would allow a UAF.
+			upgradable: inner.inner.drop,
+			inner,
+			lifetime: PhantomData
+		}
 	}
 
 	/// Attempts to downcast a temporary dynamic value (like [`DynValue`] or [`DynTensor`]) to a more strongly typed
@@ -92,7 +107,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRef<'v, Type> {
 	pub fn downcast<OtherType: ValueTypeMarker + DowncastableTarget + ?Sized>(self) -> Result<ValueRef<'v, OtherType>> {
 		let dt = self.dtype();
 		if OtherType::can_downcast(dt) {
-			Ok(unsafe { std::mem::transmute::<ValueRef<'v, Type>, ValueRef<'v, OtherType>>(self) })
+			Ok(unsafe { transmute::<ValueRef<'v, Type>, ValueRef<'v, OtherType>>(self) })
 		} else {
 			Err(Error::new_with_code(ErrorCode::InvalidArgument, format!("Cannot downcast &{dt} to &{}", OtherType::format())))
 		}
@@ -100,9 +115,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRef<'v, Type> {
 
 	/// Attempts to upgrade this `ValueRef` to an owned [`Value`] holding the same data.
 	pub fn try_upgrade(self) -> Result<Value<Type>, Self> {
-		// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
-		// duration of the kernel, allowing an upgrade would allow a UAF.
-		if !self.inner.inner.drop {
+		if !self.upgradable {
 			return Err(self);
 		}
 
@@ -110,7 +123,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRef<'v, Type> {
 	}
 
 	pub fn into_dyn(self) -> ValueRef<'v, DynValueTypeMarker> {
-		unsafe { std::mem::transmute(self) }
+		unsafe { transmute(self) }
 	}
 }
 
@@ -126,12 +139,19 @@ impl<Type: ValueTypeMarker + ?Sized> Deref for ValueRef<'_, Type> {
 #[derive(Debug)]
 pub struct ValueRefMut<'v, Type: ValueTypeMarker + ?Sized = DynValueTypeMarker> {
 	inner: Value<Type>,
+	pub(crate) upgradable: bool,
 	lifetime: PhantomData<&'v ()>
 }
 
 impl<'v, Type: ValueTypeMarker + ?Sized> ValueRefMut<'v, Type> {
 	pub(crate) fn new(inner: Value<Type>) -> Self {
-		ValueRefMut { inner, lifetime: PhantomData }
+		ValueRefMut {
+			// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
+			// duration of the kernel, allowing an upgrade would allow a UAF.
+			upgradable: inner.inner.drop,
+			inner,
+			lifetime: PhantomData
+		}
 	}
 
 	/// Attempts to downcast a temporary mutable dynamic value (like [`DynValue`] or [`DynTensor`]) to a more
@@ -140,7 +160,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRefMut<'v, Type> {
 	pub fn downcast<OtherType: ValueTypeMarker + DowncastableTarget + ?Sized>(self) -> Result<ValueRefMut<'v, OtherType>> {
 		let dt = self.dtype();
 		if OtherType::can_downcast(dt) {
-			Ok(unsafe { std::mem::transmute::<ValueRefMut<'v, Type>, ValueRefMut<'v, OtherType>>(self) })
+			Ok(unsafe { transmute::<ValueRefMut<'v, Type>, ValueRefMut<'v, OtherType>>(self) })
 		} else {
 			Err(Error::new_with_code(ErrorCode::InvalidArgument, format!("Cannot downcast &mut {dt} to &mut {}", OtherType::format())))
 		}
@@ -148,9 +168,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRefMut<'v, Type> {
 
 	/// Attempts to upgrade this `ValueRefMut` to an owned [`Value`] holding the same data.
 	pub fn try_upgrade(self) -> Result<Value<Type>, Self> {
-		// We cannot upgade a value which we cannot drop, i.e. `ValueRef`s used in operator kernels. Those only last for the
-		// duration of the kernel, allowing an upgrade would allow a UAF.
-		if !self.inner.inner.drop {
+		if !self.upgradable {
 			return Err(self);
 		}
 
@@ -158,7 +176,7 @@ impl<'v, Type: ValueTypeMarker + ?Sized> ValueRefMut<'v, Type> {
 	}
 
 	pub fn into_dyn(self) -> ValueRefMut<'v, DynValueTypeMarker> {
-		unsafe { std::mem::transmute(self) }
+		unsafe { transmute(self) }
 	}
 }
 
@@ -185,7 +203,7 @@ impl<Type: ValueTypeMarker + ?Sized> DerefMut for ValueRefMut<'_, Type> {
 /// ```
 /// # use ort::{session::Session, value::Tensor};
 /// # fn main() -> ort::Result<()> {
-/// # 	let upsample = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+/// # 	let mut upsample = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 /// // Create a Tensor value from a raw data vector
 /// let value = Tensor::from_array(([1usize, 1, 1, 3], vec![1.0_f32, 2.0, 3.0].into_boxed_slice()))?;
 ///
@@ -194,7 +212,7 @@ impl<Type: ValueTypeMarker + ?Sized> DerefMut for ValueRefMut<'_, Type> {
 /// let value = Tensor::from_array(ndarray::Array4::<f32>::zeros((1, 16, 16, 3)))?;
 ///
 /// // Get a DynValue from a session's output
-/// let value = &upsample.run(ort::inputs![value]?)?[0];
+/// let value = &upsample.run(ort::inputs![value])?[0];
 /// # 	Ok(())
 /// # }
 /// ```
@@ -235,14 +253,14 @@ pub trait ValueTypeMarker {
 	#[doc(hidden)]
 	fn format() -> String;
 
-	crate::private_trait!();
+	private_trait!();
 }
 
 /// Represents a type that a [`DynValue`] can be downcast to.
 pub trait DowncastableTarget: ValueTypeMarker {
 	fn can_downcast(dtype: &ValueType) -> bool;
 
-	crate::private_trait!();
+	private_trait!();
 }
 
 // this implementation is used in case we want to extract `DynValue`s from a [`Sequence`]; see `try_extract_sequence`
@@ -251,7 +269,7 @@ impl DowncastableTarget for DynValueTypeMarker {
 		true
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 
 /// The dynamic type marker, used for values which can be of any type.
@@ -262,16 +280,16 @@ impl ValueTypeMarker for DynValueTypeMarker {
 		"DynValue".to_string()
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 impl MapValueTypeMarker for DynValueTypeMarker {
-	crate::private_impl!();
+	private_impl!();
 }
 impl SequenceValueTypeMarker for DynValueTypeMarker {
-	crate::private_impl!();
+	private_impl!();
 }
 impl TensorValueTypeMarker for DynValueTypeMarker {
-	crate::private_impl!();
+	private_impl!();
 }
 
 unsafe impl<Type: ValueTypeMarker + ?Sized> Send for Value<Type> {}
@@ -296,8 +314,8 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 	/// - `session` must be `Some` for values returned from a session.
 	#[must_use]
 	pub unsafe fn from_ptr(ptr: NonNull<ort_sys::OrtValue>, session: Option<Arc<SharedSessionInner>>) -> Value<Type> {
-		let mut typeinfo_ptr = std::ptr::null_mut();
-		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr)];
+		let mut typeinfo_ptr = ptr::null_mut();
+		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible")];
 		Value {
 			inner: Arc::new(ValueInner {
 				ptr,
@@ -314,8 +332,8 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 	/// contexts.
 	#[must_use]
 	pub(crate) unsafe fn from_ptr_nodrop(ptr: NonNull<ort_sys::OrtValue>, session: Option<Arc<SharedSessionInner>>) -> Value<Type> {
-		let mut typeinfo_ptr = std::ptr::null_mut();
-		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr)];
+		let mut typeinfo_ptr = ptr::null_mut();
+		ortsys![unsafe GetTypeInfo(ptr.as_ptr(), &mut typeinfo_ptr).expect("infallible")];
 		Value {
 			inner: Arc::new(ValueInner {
 				ptr,
@@ -340,7 +358,7 @@ impl<Type: ValueTypeMarker + ?Sized> Value<Type> {
 
 	/// Converts this value into a type-erased [`DynValue`].
 	pub fn into_dyn(self) -> DynValue {
-		unsafe { std::mem::transmute(self) }
+		unsafe { transmute(self) }
 	}
 
 	pub(crate) fn clone_of(value: &Self) -> Self {
@@ -365,7 +383,7 @@ impl Value<DynValueTypeMarker> {
 	/// ```
 	pub fn is_tensor(&self) -> bool {
 		let mut result = 0;
-		ortsys![unsafe IsTensor(self.ptr(), &mut result)]; // infallible
+		ortsys![unsafe IsTensor(self.ptr(), &mut result).expect("infallible")];
 		result == 1
 	}
 
@@ -375,7 +393,7 @@ impl Value<DynValueTypeMarker> {
 	pub fn downcast<OtherType: ValueTypeMarker + DowncastableTarget + ?Sized>(self) -> Result<Value<OtherType>> {
 		let dt = self.dtype();
 		if OtherType::can_downcast(dt) {
-			Ok(unsafe { std::mem::transmute::<Value<DynValueTypeMarker>, Value<OtherType>>(self) })
+			Ok(unsafe { transmute::<Value<DynValueTypeMarker>, Value<OtherType>>(self) })
 		} else {
 			Err(Error::new_with_code(ErrorCode::InvalidArgument, format!("Cannot downcast {dt} to {}", OtherType::format())))
 		}
@@ -469,13 +487,13 @@ mod tests {
 
 	#[test]
 	fn test_sequence_map() -> crate::Result<()> {
-		let map_contents = [("meaning".to_owned(), 42.0), ("pi".to_owned(), std::f32::consts::PI)];
+		let map_contents = [("meaning".to_owned(), 42.0), ("pi".to_owned(), core::f32::consts::PI)];
 		let value = Sequence::new([Map::<String, f32>::new(map_contents)?])?;
 
 		for map in value.extract_sequence(&Allocator::default()) {
-			let map = map.extract_map();
+			let map = map.extract_raw_map().into_iter().collect::<std::collections::HashMap<_, _>>();
 			assert_eq!(map["meaning"], 42.0);
-			assert_eq!(map["pi"], std::f32::consts::PI);
+			assert_eq!(map["pi"], core::f32::consts::PI);
 		}
 
 		Ok(())

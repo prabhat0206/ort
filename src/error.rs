@@ -1,23 +1,28 @@
-use std::{convert::Infallible, ffi::CString, fmt, ptr};
+use alloc::{
+	ffi::CString,
+	format,
+	string::{String, ToString}
+};
+use core::{convert::Infallible, ffi::c_char, fmt, ptr};
 
 use crate::{char_p_to_string, ortsys};
 
 /// Type alias for the Result type returned by ORT functions.
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 pub(crate) trait IntoStatus {
-	fn into_status(self) -> *mut ort_sys::OrtStatus;
+	fn into_status(self) -> ort_sys::OrtStatusPtr;
 }
 
 impl<T> IntoStatus for Result<T, Error> {
-	fn into_status(self) -> *mut ort_sys::OrtStatus {
+	fn into_status(self) -> ort_sys::OrtStatusPtr {
 		let (code, message) = match &self {
-			Ok(_) => return ptr::null_mut(),
+			Ok(_) => return ort_sys::OrtStatusPtr(ptr::null_mut()),
 			Err(e) => (ort_sys::OrtErrorCode::ORT_FAIL, Some(e.to_string()))
 		};
 		let message = message.map(|c| CString::new(c).unwrap_or_else(|_| unreachable!()));
 		// message will be copied, so this shouldn't leak
-		ortsys![unsafe CreateStatus(code, message.map(|c| c.as_ptr()).unwrap_or_else(std::ptr::null))]
+		ortsys![unsafe CreateStatus(code, message.map(|c| c.as_ptr()).unwrap_or_else(ptr::null))]
 	}
 }
 
@@ -33,7 +38,20 @@ impl Error {
 	///
 	/// This can be used to return custom errors from e.g. training dataloaders or custom operators if a non-`ort`
 	/// related operation fails.
+	#[cfg(feature = "std")]
 	pub fn wrap<T: std::error::Error + Send + Sync + 'static>(err: T) -> Self {
+		Error {
+			code: ErrorCode::GenericFailure,
+			msg: err.to_string()
+		}
+	}
+
+	/// Wrap a custom, user-provided error in an [`ort::Error`](Error)..
+	///
+	/// This can be used to return custom errors from e.g. training dataloaders or custom operators if a non-`ort`
+	/// related operation fails.
+	#[cfg(not(feature = "std"))]
+	pub fn wrap<T: core::fmt::Display + Send + Sync + 'static>(err: T) -> Self {
 		Error {
 			code: ErrorCode::GenericFailure,
 			msg: err.to_string()
@@ -68,7 +86,18 @@ impl fmt::Display for Error {
 	}
 }
 
+#[cfg(feature = "std")] // sigh...
 impl std::error::Error for Error {}
+
+#[cfg(feature = "std")]
+impl From<Box<dyn std::error::Error + Send + Sync + 'static>> for Error {
+	fn from(err: Box<dyn std::error::Error + Send + Sync + 'static>) -> Self {
+		Error {
+			code: ErrorCode::GenericFailure,
+			msg: err.to_string()
+		}
+	}
+}
 
 impl From<Infallible> for Error {
 	fn from(value: Infallible) -> Self {
@@ -76,8 +105,8 @@ impl From<Infallible> for Error {
 	}
 }
 
-impl From<std::ffi::NulError> for Error {
-	fn from(e: std::ffi::NulError) -> Self {
+impl From<alloc::ffi::NulError> for Error {
+	fn from(e: alloc::ffi::NulError) -> Self {
 		Error::new(format!("Attempted to pass invalid string to C: {e}"))
 	}
 }
@@ -145,12 +174,16 @@ pub(crate) fn assert_non_null_pointer<T>(ptr: *const T, name: &'static str) -> R
 		.ok_or_else(|| Error::new(format!("Expected pointer `{name}` to not be null")))
 }
 
-pub(crate) fn status_to_result(status: *mut ort_sys::OrtStatus) -> Result<(), Error> {
+/// Converts an [`ort_sys::OrtStatus`] to a [`Result`].
+///
+/// Note that this frees `status`!
+pub(crate) unsafe fn status_to_result(status: ort_sys::OrtStatusPtr) -> Result<(), Error> {
+	let status = status.0;
 	if status.is_null() {
 		Ok(())
 	} else {
 		let code = ErrorCode::from(ortsys![unsafe GetErrorCode(status)]);
-		let raw: *const std::os::raw::c_char = ortsys![unsafe GetErrorMessage(status)];
+		let raw: *const c_char = ortsys![unsafe GetErrorMessage(status)];
 		match char_p_to_string(raw) {
 			Ok(msg) => {
 				ortsys![unsafe ReleaseStatus(status)];

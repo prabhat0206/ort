@@ -1,7 +1,9 @@
-use std::{
-	ffi::{CString, c_char, c_void},
+use alloc::{boxed::Box, ffi::CString, string::String, vec, vec::Vec};
+use core::{
+	ffi::{c_char, c_void},
 	ops::{Deref, DerefMut},
-	ptr::{self, NonNull}
+	ptr::{self, NonNull},
+	slice
 };
 
 use crate::{
@@ -17,11 +19,12 @@ pub trait Kernel {
 	fn compute(&mut self, ctx: &KernelContext) -> crate::Result<()>;
 }
 
-pub(crate) struct DummyKernel;
-
-impl Kernel for DummyKernel {
-	fn compute(&mut self, _: &KernelContext) -> crate::Result<()> {
-		unimplemented!()
+impl<F> Kernel for F
+where
+	F: FnMut(&KernelContext) -> crate::Result<()>
+{
+	fn compute(&mut self, ctx: &KernelContext) -> crate::Result<()> {
+		self(ctx)
 	}
 }
 
@@ -32,10 +35,9 @@ impl KernelAttributes {
 		Self(NonNull::from(unsafe { &*info }))
 	}
 
-	#[allow(private_bounds)]
 	pub fn get<'s, T: GetKernelAttribute<'s>>(&'s self, name: impl AsRef<str>) -> Option<T> {
 		let name = CString::new(name.as_ref()).ok()?;
-		T::get_from(self.0.as_ptr(), name.as_ptr())
+		unsafe { T::get_from(self.0.as_ptr(), name.as_ptr()) }
 	}
 
 	pub fn inputs(&self) -> Result<Vec<Input>> {
@@ -105,75 +107,83 @@ impl AsPointer for KernelAttributes {
 	}
 }
 
-pub(crate) trait GetKernelAttribute<'s> {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+pub trait GetKernelAttribute<'s> {
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized;
 }
 
 impl GetKernelAttribute<'_> for f32 {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
 		let mut value = Self::default();
-		status_to_result(ortsys![unsafe KernelInfoGetAttribute_float(info, name, &mut value)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttribute_float(info, name, &mut value)];
+		unsafe { status_to_result(res) }.ok()?;
 		Some(value)
 	}
 }
 
 impl GetKernelAttribute<'_> for i64 {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
 		let mut value = Self::default();
-		status_to_result(ortsys![unsafe KernelInfoGetAttribute_int64(info, name, &mut value)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttribute_int64(info, name, &mut value)];
+		unsafe { status_to_result(res) }.ok()?;
 		Some(value)
 	}
 }
 
 impl GetKernelAttribute<'_> for String {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
 		let mut size = 0;
-		status_to_result(ortsys![unsafe KernelInfoGetAttribute_string(info, name, ptr::null_mut(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttribute_string(info, name, ptr::null_mut(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		let mut out = vec![0u8; size];
-		status_to_result(ortsys![unsafe KernelInfoGetAttribute_string(info, name, out.as_mut_ptr().cast::<c_char>(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttribute_string(info, name, out.as_mut_ptr().cast::<c_char>(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		CString::from_vec_with_nul(out).ok().and_then(|c| c.into_string().ok())
 	}
 }
 
 impl GetKernelAttribute<'_> for Vec<f32> {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
 		let mut size = 0;
-		status_to_result(ortsys![unsafe KernelInfoGetAttributeArray_float(info, name, ptr::null_mut(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttributeArray_float(info, name, ptr::null_mut(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		let mut out = vec![0f32; size];
-		status_to_result(ortsys![unsafe KernelInfoGetAttributeArray_float(info, name, out.as_mut_ptr(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttributeArray_float(info, name, out.as_mut_ptr(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		Some(out)
 	}
 }
 
 impl GetKernelAttribute<'_> for Vec<i64> {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
 		let mut size = 0;
-		status_to_result(ortsys![unsafe KernelInfoGetAttributeArray_int64(info, name, ptr::null_mut(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttributeArray_int64(info, name, ptr::null_mut(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		let mut out = vec![0i64; size];
-		status_to_result(ortsys![unsafe KernelInfoGetAttributeArray_int64(info, name, out.as_mut_ptr(), &mut size)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttributeArray_int64(info, name, out.as_mut_ptr(), &mut size)];
+		unsafe { status_to_result(res) }.ok()?;
 		Some(out)
 	}
 }
 
 impl<'s, T: DowncastableTarget> GetKernelAttribute<'s> for ValueRef<'s, T> {
-	fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
+	unsafe fn get_from(info: *mut ort_sys::OrtKernelInfo, name: *const ort_sys::c_char) -> Option<Self>
 	where
 		Self: Sized
 	{
@@ -182,7 +192,8 @@ impl<'s, T: DowncastableTarget> GetKernelAttribute<'s> for ValueRef<'s, T> {
 		let allocator = Allocator::default();
 
 		let mut value_ptr: *mut ort_sys::OrtValue = ptr::null_mut();
-		status_to_result(ortsys![unsafe KernelInfoGetAttribute_tensor(info, name, allocator.ptr().cast_mut(), &mut value_ptr)]).ok()?;
+		let res = ortsys![unsafe KernelInfoGetAttribute_tensor(info, name, allocator.ptr().cast_mut(), &mut value_ptr)];
+		unsafe { status_to_result(res) }.ok()?;
 		unsafe { ValueRef::new(DynValue::from_ptr(NonNull::new(value_ptr)?, None)) }
 			.downcast()
 			.ok()
@@ -199,12 +210,12 @@ impl<T> Deref for ScratchBuffer<T> {
 	type Target = [T];
 
 	fn deref(&self) -> &Self::Target {
-		unsafe { std::slice::from_raw_parts(self.buffer.cast_const(), self.size) }
+		unsafe { slice::from_raw_parts(self.buffer.cast_const(), self.size) }
 	}
 }
 impl<T> DerefMut for ScratchBuffer<T> {
 	fn deref_mut(&mut self) -> &mut Self::Target {
-		unsafe { std::slice::from_raw_parts_mut(self.buffer, self.size) }
+		unsafe { slice::from_raw_parts_mut(self.buffer, self.size) }
 	}
 }
 
@@ -269,7 +280,7 @@ impl KernelContext {
 		F: Fn(usize) + Sync + Send
 	{
 		let executor = Box::new(f) as Box<dyn Fn(usize) + Sync + Send>;
-		ortsys![unsafe KernelContext_ParallelFor(self.ptr.as_ptr(), Some(parallel_for_cb), total, max_num_batches, &executor as *const _ as *mut c_void)?];
+		ortsys![unsafe KernelContext_ParallelFor(self.ptr.as_ptr(), parallel_for_cb, total, max_num_batches, &executor as *const _ as *mut c_void)?];
 		Ok(())
 	}
 
@@ -283,7 +294,7 @@ impl KernelContext {
 	// 		unsafe KernelContext_GetScratchBuffer(
 	// 			self.ptr.as_ptr(),
 	// 			memory_info.ptr.as_ptr(),
-	// 			len * std::mem::size_of::<T>(),
+	// 			len * core::mem::size_of::<T>(),
 	// 			&mut buffer
 	// 		)?;
 	// 		nonNull(buffer)
@@ -313,7 +324,7 @@ impl AsPointer for KernelContext {
 	}
 }
 
-extern "C" fn parallel_for_cb(user_data: *mut c_void, iterator: usize) {
+extern "system" fn parallel_for_cb(user_data: *mut c_void, iterator: usize) {
 	let executor = unsafe { &*user_data.cast::<Box<dyn Fn(usize) + Sync + Send>>() };
 	executor(iterator)
 }

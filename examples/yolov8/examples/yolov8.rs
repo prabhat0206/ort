@@ -7,7 +7,8 @@ use ndarray::{Array, Axis, s};
 use ort::{
 	execution_providers::CUDAExecutionProvider,
 	inputs,
-	session::{Session, SessionOutputs}
+	session::{Session, SessionOutputs},
+	value::TensorRef
 };
 use raqote::{DrawOptions, DrawTarget, LineJoin, PathBuilder, SolidSource, Source, StrokeStyle};
 use show_image::{AsImageView, WindowOptions, event};
@@ -28,7 +29,7 @@ fn union(box1: &BoundingBox, box2: &BoundingBox) -> f32 {
 	((box1.x2 - box1.x1) * (box1.y2 - box1.y1)) + ((box2.x2 - box2.x1) * (box2.y2 - box2.y1)) - intersection(box1, box2)
 }
 
-const YOLOV8M_URL: &str = "https://parcel.pyke.io/v2/cdn/assetdelivery/ortrsv2/ex_models/yolov8m.onnx";
+const YOLOV8M_URL: &str = "https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/yolov8m.onnx";
 
 #[rustfmt::skip]
 const YOLOV8_CLASS_LABELS: [&str; 80] = [
@@ -63,10 +64,10 @@ fn main() -> ort::Result<()> {
 		input[[0, 2, y, x]] = (b as f32) / 255.;
 	}
 
-	let model = Session::builder()?.commit_from_url(YOLOV8M_URL)?;
+	let mut model = Session::builder()?.commit_from_url(YOLOV8M_URL)?;
 
 	// Run YOLOv8 inference
-	let outputs: SessionOutputs = model.run(inputs!["images" => input.view()]?)?;
+	let outputs: SessionOutputs = model.run(inputs!["images" => TensorRef::from_array_view(&input)?])?;
 	let output = outputs["output0"].try_extract_tensor::<f32>()?.t().into_owned();
 
 	let mut boxes = Vec::new();

@@ -1,3 +1,5 @@
+use alloc::format;
+
 use crate::{
 	error::{Error, Result},
 	execution_providers::{ExecutionProvider, ExecutionProviderDispatch},
@@ -6,7 +8,7 @@ use crate::{
 
 #[cfg(all(not(feature = "load-dynamic"), feature = "armnn"))]
 extern "C" {
-	fn OrtSessionOptionsAppendExecutionProvider_ArmNN(options: *mut ort_sys::OrtSessionOptions, use_arena: std::os::raw::c_int) -> ort_sys::OrtStatusPtr;
+	fn OrtSessionOptionsAppendExecutionProvider_ArmNN(options: *mut ort_sys::OrtSessionOptions, use_arena: core::ffi::c_int) -> ort_sys::OrtStatusPtr;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -16,8 +18,8 @@ pub struct ArmNNExecutionProvider {
 
 impl ArmNNExecutionProvider {
 	#[must_use]
-	pub fn with_arena_allocator(mut self) -> Self {
-		self.use_arena = true;
+	pub fn with_arena_allocator(mut self, enable: bool) -> Self {
+		self.use_arena = enable;
 		self
 	}
 
@@ -48,8 +50,8 @@ impl ExecutionProvider for ArmNNExecutionProvider {
 		{
 			use crate::AsPointer;
 
-			super::get_ep_register!(OrtSessionOptionsAppendExecutionProvider_ArmNN(options: *mut ort_sys::OrtSessionOptions, use_arena: std::os::raw::c_int) -> ort_sys::OrtStatusPtr);
-			return crate::error::status_to_result(unsafe { OrtSessionOptionsAppendExecutionProvider_ArmNN(session_builder.ptr_mut(), self.use_arena.into()) });
+			super::get_ep_register!(OrtSessionOptionsAppendExecutionProvider_ArmNN(options: *mut ort_sys::OrtSessionOptions, use_arena: core::ffi::c_int) -> ort_sys::OrtStatusPtr);
+			return unsafe { crate::error::status_to_result(OrtSessionOptionsAppendExecutionProvider_ArmNN(session_builder.ptr_mut(), self.use_arena.into())) };
 		}
 
 		Err(Error::new(format!("`{}` was not registered because its corresponding Cargo feature is not enabled.", self.as_str())))

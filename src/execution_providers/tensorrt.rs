@@ -1,3 +1,5 @@
+use alloc::{format, string::ToString};
+
 use super::{ArbitrarilyConfigurableExecutionProvider, ExecutionProviderOptions};
 use crate::{
 	error::{Error, Result},
@@ -135,7 +137,7 @@ impl TensorRTExecutionProvider {
 
 	#[must_use]
 	pub fn with_context_memory_sharing(mut self, enable: bool) -> Self {
-		self.options.set("trt_enable_context_memory_sharing", if enable { "1" } else { "0" });
+		self.options.set("trt_context_memory_sharing_enable", if enable { "1" } else { "0" });
 		self
 	}
 
@@ -171,13 +173,13 @@ impl TensorRTExecutionProvider {
 
 	#[must_use]
 	pub fn with_build_heuristics(mut self, enable: bool) -> Self {
-		self.options.set("trt_enable_build_heuristics", if enable { "1" } else { "0" });
+		self.options.set("trt_build_heuristics_enable", if enable { "1" } else { "0" });
 		self
 	}
 
 	#[must_use]
 	pub fn with_sparsity(mut self, enable: bool) -> Self {
-		self.options.set("trt_enable_sparsity", if enable { "1" } else { "0" });
+		self.options.set("trt_sparsity_enable", if enable { "1" } else { "0" });
 		self
 	}
 
@@ -292,19 +294,24 @@ impl ExecutionProvider for TensorRTExecutionProvider {
 			// environment initialized.
 			let _ = crate::environment::get_environment();
 
-			let mut trt_options: *mut ort_sys::OrtTensorRTProviderOptionsV2 = std::ptr::null_mut();
+			let mut trt_options: *mut ort_sys::OrtTensorRTProviderOptionsV2 = core::ptr::null_mut();
 			crate::ortsys![unsafe CreateTensorRTProviderOptions(&mut trt_options)?];
 			let ffi_options = self.options.to_ffi();
-			if let Err(e) = crate::error::status_to_result(
-				crate::ortsys![unsafe UpdateTensorRTProviderOptions(trt_options, ffi_options.key_ptrs(), ffi_options.value_ptrs(), ffi_options.len())]
-			) {
+
+			let res = crate::ortsys![unsafe UpdateTensorRTProviderOptions(
+				trt_options,
+				ffi_options.key_ptrs(),
+				ffi_options.value_ptrs(),
+				ffi_options.len()
+			)];
+			if let Err(e) = unsafe { crate::error::status_to_result(res) } {
 				crate::ortsys![unsafe ReleaseTensorRTProviderOptions(trt_options)];
 				return Err(e);
 			}
 
 			let status = crate::ortsys![unsafe SessionOptionsAppendExecutionProvider_TensorRT_V2(session_builder.ptr_mut(), trt_options)];
 			crate::ortsys![unsafe ReleaseTensorRTProviderOptions(trt_options)];
-			return crate::error::status_to_result(status);
+			return unsafe { crate::error::status_to_result(status) };
 		}
 
 		Err(Error::new(format!("`{}` was not registered because its corresponding Cargo feature is not enabled.", self.as_str())))

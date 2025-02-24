@@ -1,4 +1,5 @@
-use std::{
+use alloc::{string::String, vec::Vec};
+use core::{
 	ffi::c_void,
 	iter::FusedIterator,
 	mem::ManuallyDrop,
@@ -16,11 +17,11 @@ use crate::{
 /// This type allows session outputs to be retrieved by index or by name.
 ///
 /// ```
-/// # use ort::session::{builder::GraphOptimizationLevel, Session};
+/// # use ort::{value::TensorRef, session::{builder::GraphOptimizationLevel, Session}};
 /// # fn main() -> ort::Result<()> {
-/// let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 /// let input = ndarray::Array4::<f32>::zeros((1, 64, 64, 3));
-/// let outputs = session.run(ort::inputs![input]?)?;
+/// let outputs = session.run(ort::inputs![TensorRef::from_array_view(&input)?])?;
 ///
 /// // get the first output
 /// let output = &outputs[0];
@@ -252,7 +253,7 @@ impl IndexMut<usize> for SessionOutputs<'_, '_> {
 }
 
 pub struct Keys<'x, 'r> {
-	iter: std::slice::Iter<'x, &'r str>,
+	iter: core::slice::Iter<'x, &'r str>,
 	effective_len: usize
 }
 
@@ -281,8 +282,8 @@ impl ExactSizeIterator for Keys<'_, '_> {}
 impl FusedIterator for Keys<'_, '_> {}
 
 pub struct Values<'x, 'k> {
-	value_iter: std::slice::Iter<'x, DynValue>,
-	key_iter: std::slice::Iter<'x, &'k str>,
+	value_iter: core::slice::Iter<'x, DynValue>,
+	key_iter: core::slice::Iter<'x, &'k str>,
 	effective_len: usize
 }
 
@@ -311,8 +312,8 @@ impl ExactSizeIterator for Values<'_, '_> {}
 impl FusedIterator for Values<'_, '_> {}
 
 pub struct ValuesMut<'x, 'k> {
-	value_iter: std::slice::IterMut<'x, DynValue>,
-	key_iter: std::slice::Iter<'x, &'k str>,
+	value_iter: core::slice::IterMut<'x, DynValue>,
+	key_iter: core::slice::Iter<'x, &'k str>,
 	effective_len: usize
 }
 
@@ -341,8 +342,8 @@ impl ExactSizeIterator for ValuesMut<'_, '_> {}
 impl FusedIterator for ValuesMut<'_, '_> {}
 
 pub struct Iter<'x, 'k> {
-	value_iter: std::slice::Iter<'x, DynValue>,
-	key_iter: std::slice::Iter<'x, &'k str>,
+	value_iter: core::slice::Iter<'x, DynValue>,
+	key_iter: core::slice::Iter<'x, &'k str>,
 	effective_len: usize
 }
 
@@ -371,8 +372,8 @@ impl ExactSizeIterator for Iter<'_, '_> {}
 impl FusedIterator for Iter<'_, '_> {}
 
 pub struct IterMut<'x, 'k> {
-	value_iter: std::slice::IterMut<'x, DynValue>,
-	key_iter: std::slice::Iter<'x, &'k str>,
+	value_iter: core::slice::IterMut<'x, DynValue>,
+	key_iter: core::slice::Iter<'x, &'k str>,
 	effective_len: usize
 }
 
@@ -401,8 +402,8 @@ impl ExactSizeIterator for IterMut<'_, '_> {}
 impl FusedIterator for IterMut<'_, '_> {}
 
 pub struct IntoIter<'r, 's> {
-	keys: std::vec::IntoIter<&'r str>,
-	values: std::vec::IntoIter<DynValue>,
+	keys: alloc::vec::IntoIter<&'r str>,
+	values: alloc::vec::IntoIter<DynValue>,
 	effective_len: usize,
 	backing_ptr: Option<(&'s Allocator, *mut c_void)>
 }

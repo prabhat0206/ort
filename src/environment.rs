@@ -11,28 +11,18 @@
 //! # }
 //! ```
 
-use std::{
+use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
+use core::{
 	any::Any,
-	ffi::{self, CStr, CString},
-	os::raw::c_void,
-	ptr::{self, NonNull},
-	sync::{Arc, RwLock}
+	ffi::c_void,
+	ptr::{self, NonNull}
 };
-
-use ort_sys::c_char;
-use tracing::{Level, debug};
 
 #[cfg(feature = "load-dynamic")]
 use crate::G_ORT_DYLIB_PATH;
-use crate::{AsPointer, error::Result, execution_providers::ExecutionProviderDispatch, extern_system_fn, ortsys};
+use crate::{AsPointer, error::Result, execution_providers::ExecutionProviderDispatch, ortsys, util::OnceLock};
 
-struct EnvironmentSingleton {
-	lock: RwLock<Option<Arc<Environment>>>
-}
-
-unsafe impl Sync for EnvironmentSingleton {}
-
-static G_ENV: EnvironmentSingleton = EnvironmentSingleton { lock: RwLock::new(None) };
+static G_ENV: OnceLock<Environment> = OnceLock::new();
 
 /// An `Environment` is a process-global structure, under which [`Session`](crate::session::Session)s are created.
 ///
@@ -42,9 +32,7 @@ static G_ENV: EnvironmentSingleton = EnvironmentSingleton { lock: RwLock::new(No
 /// environments are also used to configure ONNX Runtime to send log messages through the [`tracing`] crate in Rust.
 ///
 /// For ease of use, and since sessions require an environment to be created, `ort` will automatically create an
-/// environment if one is not configured via [`init`] (or [`init_from`]). [`init`] can be called at any point in the
-/// program (even after an environment has been automatically created), though every session created before the
-/// re-configuration would need to be re-created in order to use the config from the new environment.
+/// environment if one is not configured via [`init`] (or [`init_from`]).
 #[derive(Debug)]
 pub struct Environment {
 	pub(crate) execution_providers: Vec<ExecutionProviderDispatch>,
@@ -66,24 +54,18 @@ impl AsPointer for Environment {
 
 impl Drop for Environment {
 	fn drop(&mut self) {
-		debug!(ptr = ?self.ptr(), "Releasing environment");
+		crate::debug!(ptr = ?self.ptr(), "Releasing environment");
 		ortsys![unsafe ReleaseEnv(self.ptr_mut())];
 	}
 }
 
 /// Gets a reference to the global environment, creating one if an environment has not been
 /// [`commit`](EnvironmentBuilder::commit)ted yet.
-pub fn get_environment() -> Result<Arc<Environment>> {
-	let env = G_ENV.lock.read().expect("poisoned lock");
-	if let Some(env) = env.as_ref() {
-		Ok(Arc::clone(env))
-	} else {
-		// drop our read lock so we dont deadlock when `commit` takes a write lock
-		drop(env);
-
-		debug!("Environment not yet initialized, creating a new one");
-		Ok(EnvironmentBuilder::new().commit()?)
-	}
+pub fn get_environment() -> Result<&'static Environment> {
+	G_ENV.get_or_try_init(|| {
+		crate::debug!("Environment not yet initialized, creating a new one");
+		EnvironmentBuilder::new().commit_internal()
+	})
 }
 
 #[derive(Debug)]
@@ -95,7 +77,7 @@ pub struct GlobalThreadPoolOptions {
 impl Default for GlobalThreadPoolOptions {
 	fn default() -> Self {
 		let mut ptr = ptr::null_mut();
-		ortsys![unsafe CreateThreadingOptions(&mut ptr)];
+		ortsys![unsafe CreateThreadingOptions(&mut ptr).expect("failed to create threading options")];
 		Self { ptr, thread_manager: None }
 	}
 }
@@ -172,7 +154,7 @@ pub trait ThreadManager {
 	fn join(thread: Self::Thread) -> crate::Result<()>;
 }
 
-pub(crate) unsafe extern "C" fn thread_create<T: ThreadManager + Any>(
+pub(crate) unsafe extern "system" fn thread_create<T: ThreadManager + Any>(
 	ort_custom_thread_creation_options: *mut c_void,
 	ort_thread_worker_fn: ort_sys::OrtThreadWorkerFn,
 	ort_worker_fn_param: *mut c_void
@@ -182,29 +164,36 @@ pub(crate) unsafe extern "C" fn thread_create<T: ThreadManager + Any>(
 		worker: ort_thread_worker_fn
 	};
 
-	let res = std::panic::catch_unwind(|| {
+	let runner = || {
 		let manager = unsafe { &mut *ort_custom_thread_creation_options.cast::<T>() };
 		<T as ThreadManager>::create(manager, thread_worker)
-	});
+	};
+	#[cfg(not(feature = "std"))]
+	let res = Result::<_, crate::Error>::Ok(runner()); // dumb hack
+	#[cfg(feature = "std")]
+	let res = std::panic::catch_unwind(runner);
 	match res {
 		Ok(Ok(thread)) => (Box::leak(Box::new(thread)) as *mut <T as ThreadManager>::Thread)
 			.cast_const()
 			.cast::<ort_sys::OrtCustomHandleType>(),
 		Ok(Err(e)) => {
-			tracing::error!("Failed to create thread using manager: {e}");
+			crate::error!("Failed to create thread using manager: {e}");
+			let _ = e;
 			ptr::null()
 		}
 		Err(e) => {
-			tracing::error!("Thread manager panicked: {e:?}");
+			crate::error!("Thread manager panicked: {e:?}");
+			let _ = e;
 			ptr::null()
 		}
 	}
 }
 
-pub(crate) unsafe extern "C" fn thread_join<T: ThreadManager + Any>(ort_custom_thread_handle: ort_sys::OrtCustomThreadHandle) {
-	let handle = Box::from_raw(ort_custom_thread_handle.cast_mut().cast::<<T as ThreadManager>::Thread>());
+pub(crate) unsafe extern "system" fn thread_join<T: ThreadManager + Any>(ort_custom_thread_handle: ort_sys::OrtCustomThreadHandle) {
+	let handle = unsafe { Box::from_raw(ort_custom_thread_handle.cast_mut().cast::<<T as ThreadManager>::Thread>()) };
 	if let Err(e) = <T as ThreadManager>::join(*handle) {
-		tracing::error!("Failed to join thread using manager: {e}");
+		crate::error!("Failed to join thread using manager: {e}");
+		let _ = e;
 	}
 }
 
@@ -219,9 +208,9 @@ pub struct EnvironmentBuilder {
 impl EnvironmentBuilder {
 	pub(crate) fn new() -> Self {
 		EnvironmentBuilder {
-			name: "default".to_string(),
+			name: String::from("default"),
 			telemetry: true,
-			execution_providers: vec![],
+			execution_providers: Vec::new(),
 			global_thread_pool_options: None
 		}
 	}
@@ -241,7 +230,7 @@ impl EnvironmentBuilder {
 	/// Typically, only Windows builds of ONNX Runtime provided by Microsoft will have telemetry enabled.
 	/// Pre-built binaries provided by pyke, or binaries compiled from source, won't have telemetry enabled.
 	///
-	/// The exact kind of telemetry data sent can be found [here](https://github.com/microsoft/onnxruntime/blob/v1.20.0/onnxruntime/core/platform/windows/telemetry.cc).
+	/// The exact kind of telemetry data sent can be found [here](https://github.com/microsoft/onnxruntime/blob/v1.20.2/onnxruntime/core/platform/windows/telemetry.cc).
 	/// Currently, this includes (but is not limited to): ONNX graph version, model producer name & version, whether or
 	/// not FP16 is used, operator domains & versions, model graph name & custom metadata, execution provider names,
 	/// error messages, and the total number & time of session inference runs. The ONNX Runtime team uses this data to
@@ -275,19 +264,27 @@ impl EnvironmentBuilder {
 		self
 	}
 
-	/// Commit the environment configuration and set the global environment.
-	pub fn commit(self) -> Result<Arc<Environment>> {
+	pub(crate) fn commit_internal(self) -> Result<Environment> {
 		let (env_ptr, thread_manager, has_global_threadpool) = if let Some(mut thread_pool_options) = self.global_thread_pool_options {
-			let mut env_ptr: *mut ort_sys::OrtEnv = std::ptr::null_mut();
-			let logging_function: ort_sys::OrtLoggingFunction = Some(custom_logger);
-			let logger_param: *mut std::ffi::c_void = std::ptr::null_mut();
+			let mut env_ptr: *mut ort_sys::OrtEnv = ptr::null_mut();
 			let cname = CString::new(self.name.clone()).unwrap_or_else(|_| unreachable!());
 
+			#[cfg(feature = "tracing")]
 			ortsys![
 				unsafe CreateEnvWithCustomLoggerAndGlobalThreadPools(
-					logging_function,
-					logger_param,
+					Some(crate::logging::custom_logger),
+					ptr::null_mut(),
 					ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
+					cname.as_ptr(),
+					thread_pool_options.ptr(),
+					&mut env_ptr
+				)?;
+				nonNull(env_ptr)
+			];
+			#[cfg(not(feature = "tracing"))]
+			ortsys![
+				unsafe CreateEnvWithGlobalThreadPools(
+					crate::logging::default_log_level(),
 					cname.as_ptr(),
 					thread_pool_options.ptr(),
 					&mut env_ptr
@@ -298,24 +295,33 @@ impl EnvironmentBuilder {
 			let thread_manager = thread_pool_options.thread_manager.take();
 			(env_ptr, thread_manager, true)
 		} else {
-			let mut env_ptr: *mut ort_sys::OrtEnv = std::ptr::null_mut();
-			let logging_function: ort_sys::OrtLoggingFunction = Some(custom_logger);
-			// FIXME: What should go here?
-			let logger_param: *mut std::ffi::c_void = std::ptr::null_mut();
+			let mut env_ptr: *mut ort_sys::OrtEnv = ptr::null_mut();
 			let cname = CString::new(self.name.clone()).unwrap_or_else(|_| unreachable!());
+
+			#[cfg(feature = "tracing")]
 			ortsys![
 				unsafe CreateEnvWithCustomLogger(
-					logging_function,
-					logger_param,
+					Some(crate::logging::custom_logger),
+					ptr::null_mut(),
 					ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
 					cname.as_ptr(),
 					&mut env_ptr
 				)?;
 				nonNull(env_ptr)
 			];
+			#[cfg(not(feature = "tracing"))]
+			ortsys![
+				unsafe CreateEnv(
+					crate::logging::default_log_level(),
+					cname.as_ptr(),
+					&mut env_ptr
+				)?;
+				nonNull(env_ptr)
+			];
+
 			(env_ptr, None, false)
 		};
-		debug!(env_ptr = format!("{env_ptr:?}").as_str(), "Environment created");
+		crate::debug!(env_ptr = alloc::format!("{env_ptr:?}").as_str(), "Environment created");
 
 		if self.telemetry {
 			ortsys![unsafe EnableTelemetryEvents(env_ptr)?];
@@ -323,21 +329,19 @@ impl EnvironmentBuilder {
 			ortsys![unsafe DisableTelemetryEvents(env_ptr)?];
 		}
 
-		let mut env_lock = G_ENV.lock.write().expect("poisoned lock");
-		// drop global reference to previous environment
-		if let Some(env_arc) = env_lock.take() {
-			drop(env_arc);
-		}
-		let env = Arc::new(Environment {
+		Ok(Environment {
 			execution_providers: self.execution_providers,
 			// we already asserted the env pointer is non-null in the `CreateEnvWithCustomLogger` call
 			ptr: unsafe { NonNull::new_unchecked(env_ptr) },
 			has_global_threadpool,
 			_thread_manager: thread_manager
-		});
-		env_lock.replace(Arc::clone(&env));
+		})
+	}
 
-		Ok(env)
+	/// Commit the environment configuration.
+	pub fn commit(self) -> Result<bool> {
+		let env = self.commit_internal()?;
+		Ok(G_ENV.try_insert(env))
 	}
 }
 
@@ -391,33 +395,6 @@ pub fn init() -> EnvironmentBuilder {
 #[cfg_attr(docsrs, doc(cfg(feature = "load-dynamic")))]
 #[must_use = "commit() must be called in order for the environment to take effect"]
 pub fn init_from(path: impl ToString) -> EnvironmentBuilder {
-	let _ = G_ORT_DYLIB_PATH.set(Arc::new(path.to_string()));
+	let _ = G_ORT_DYLIB_PATH.get_or_init(|| alloc::sync::Arc::new(path.to_string()));
 	EnvironmentBuilder::new()
-}
-
-extern_system_fn! {
-	/// Callback from C that will handle ONNX logging, forwarding ONNX's logs to the `tracing` crate.
-	pub(crate) fn custom_logger(_params: *mut ffi::c_void, severity: ort_sys::OrtLoggingLevel, _: *const c_char, id: *const c_char, code_location: *const c_char, message: *const c_char) {
-		assert_ne!(code_location, ptr::null());
-		let code_location = unsafe { CStr::from_ptr(code_location) }.to_str().unwrap_or("<decode error>");
-		assert_ne!(message, ptr::null());
-		let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap_or("<decode error>");
-		assert_ne!(id, ptr::null());
-		let id = unsafe { CStr::from_ptr(id) }.to_str().unwrap_or("<decode error>");
-
-		let span = tracing::span!(
-			Level::TRACE,
-			"ort",
-			id = id,
-			location = code_location
-		);
-
-		match severity {
-			ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE => tracing::event!(parent: &span, Level::TRACE, "{message}"),
-			ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO => tracing::event!(parent: &span, Level::DEBUG, "{message}"),
-			ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING => tracing::event!(parent: &span, Level::INFO, "{message}"),
-			ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR => tracing::event!(parent: &span, Level::WARN, "{message}"),
-			ort_sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL=> tracing::event!(parent: &span, Level::ERROR, "{message}")
-		}
-	}
 }

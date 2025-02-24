@@ -1,3 +1,5 @@
+use alloc::{format, string::ToString};
+
 use super::{ArbitrarilyConfigurableExecutionProvider, ExecutionProviderOptions};
 use crate::{
 	error::{Error, Result},
@@ -67,8 +69,8 @@ impl CANNExecutionProvider {
 
 	/// Configure whether to dump the subgraph into ONNX format for analysis of subgraph segmentation.
 	#[must_use]
-	pub fn with_dump_graphs(mut self) -> Self {
-		self.options.set("dump_graphs", "1");
+	pub fn with_dump_graphs(mut self, enable: bool) -> Self {
+		self.options.set("dump_graphs", if enable { "1" } else { "0" });
 		self
 	}
 
@@ -144,19 +146,24 @@ impl ExecutionProvider for CANNExecutionProvider {
 		{
 			use crate::AsPointer;
 
-			let mut cann_options: *mut ort_sys::OrtCANNProviderOptions = std::ptr::null_mut();
+			let mut cann_options: *mut ort_sys::OrtCANNProviderOptions = core::ptr::null_mut();
 			crate::ortsys![unsafe CreateCANNProviderOptions(&mut cann_options)?];
 			let ffi_options = self.options.to_ffi();
-			if let Err(e) = crate::error::status_to_result(
-				crate::ortsys![unsafe UpdateCANNProviderOptions(cann_options, ffi_options.key_ptrs(), ffi_options.value_ptrs(), ffi_options.len())]
-			) {
+
+			let res = crate::ortsys![unsafe UpdateCANNProviderOptions(
+				cann_options,
+				ffi_options.key_ptrs(),
+				ffi_options.value_ptrs(),
+				ffi_options.len()
+			)];
+			if let Err(e) = unsafe { crate::error::status_to_result(res) } {
 				crate::ortsys![unsafe ReleaseCANNProviderOptions(cann_options)];
 				return Err(e);
 			}
 
 			let status = crate::ortsys![unsafe SessionOptionsAppendExecutionProvider_CANN(session_builder.ptr_mut(), cann_options)];
 			crate::ortsys![unsafe ReleaseCANNProviderOptions(cann_options)];
-			return crate::error::status_to_result(status);
+			return unsafe { crate::error::status_to_result(status) };
 		}
 
 		Err(Error::new(format!("`{}` was not registered because its corresponding Cargo feature is not enabled.", self.as_str())))

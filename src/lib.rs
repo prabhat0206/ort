@@ -3,6 +3,7 @@
 #![allow(clippy::tabs_in_doc_comments, clippy::arc_with_non_send_sync)]
 #![allow(clippy::macro_metavars_in_unsafe)]
 #![warn(clippy::unwrap_used)]
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 //! <div align=center>
 //! 	<img src="https://parcel.pyke.io/v2/cdn/assetdelivery/ortrsv2/docs/trend-banner.png" width="350px">
@@ -12,17 +13,26 @@
 //! `ort` is a Rust binding for [ONNX Runtime](https://onnxruntime.ai/). For information on how to get started with `ort`,
 //! see <https://ort.pyke.io/introduction>.
 
-#[cfg(all(test, not(feature = "fetch-models")))]
-compile_error!("`cargo test --features fetch-models`!!1!");
+extern crate alloc;
+extern crate core;
+
+#[doc(hidden)]
+pub mod __private {
+	pub extern crate alloc;
+	pub extern crate core;
+}
 
 pub mod adapter;
 pub mod environment;
 pub mod error;
 pub mod execution_providers;
 pub mod io_binding;
+pub(crate) mod logging;
 pub mod memory;
 pub mod metadata;
 pub mod operator;
+#[macro_use]
+pub(crate) mod private;
 pub mod session;
 pub mod tensor;
 #[cfg(feature = "training")]
@@ -32,39 +42,24 @@ pub(crate) mod util;
 pub mod value;
 
 #[cfg(feature = "load-dynamic")]
-use std::sync::Arc;
-use std::{
-	ffi::CStr,
-	os::raw::c_char,
-	ptr::{self, NonNull},
-	sync::OnceLock
+use alloc::sync::Arc;
+use alloc::{borrow::ToOwned, boxed::Box, string::String};
+use core::{
+	ffi::{CStr, c_char},
+	ptr::NonNull,
+	slice, str
 };
 
 pub use ort_sys as sys;
 
 #[cfg(feature = "load-dynamic")]
 pub use self::environment::init_from;
+pub(crate) use self::logging::{debug, error, info, trace, warning as warn};
+use self::util::OnceLock;
 pub use self::{
 	environment::init,
 	error::{Error, ErrorCode, Result}
 };
-
-#[cfg(not(all(target_arch = "x86", target_os = "windows")))]
-macro_rules! extern_system_fn {
-	($(#[$meta:meta])* fn $($tt:tt)*) => ($(#[$meta])* extern "C" fn $($tt)*);
-	($(#[$meta:meta])* $vis:vis fn $($tt:tt)*) => ($(#[$meta])* $vis extern "C" fn $($tt)*);
-	($(#[$meta:meta])* unsafe fn $($tt:tt)*) => ($(#[$meta])* unsafe extern "C" fn $($tt)*);
-	($(#[$meta:meta])* $vis:vis unsafe fn $($tt:tt)*) => ($(#[$meta])* $vis unsafe extern "C" fn $($tt)*);
-}
-#[cfg(all(target_arch = "x86", target_os = "windows"))]
-macro_rules! extern_system_fn {
-	($(#[$meta:meta])* fn $($tt:tt)*) => ($(#[$meta])* extern "stdcall" fn $($tt)*);
-	($(#[$meta:meta])* $vis:vis fn $($tt:tt)*) => ($(#[$meta])* $vis extern "stdcall" fn $($tt)*);
-	($(#[$meta:meta])* unsafe fn $($tt:tt)*) => ($(#[$meta])* unsafe extern "stdcall" fn $($tt)*);
-	($(#[$meta:meta])* $vis:vis unsafe fn $($tt:tt)*) => ($(#[$meta])* $vis unsafe extern "stdcall" fn $($tt)*);
-}
-
-pub(crate) use extern_system_fn;
 
 /// The minor version of ONNX Runtime used by this version of `ort`.
 pub const MINOR_VERSION: u32 = ort_sys::ORT_API_VERSION;
@@ -123,87 +118,78 @@ pub fn info() -> &'static str {
 	while unsafe { *str.add(len) } != 0x00 {
 		len += 1;
 	}
-	unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(str.cast::<u8>(), len)) }
+	unsafe { str::from_utf8_unchecked(slice::from_raw_parts(str.cast::<u8>(), len)) }
 }
 
-/// Returns a pointer to the global [`ort_sys::OrtApi`] object.
+struct ApiPointer(NonNull<ort_sys::OrtApi>);
+unsafe impl Send for ApiPointer {}
+unsafe impl Sync for ApiPointer {}
+
+static G_ORT_API: OnceLock<ApiPointer> = OnceLock::new();
+
+/// Returns a reference to the global [`ort_sys::OrtApi`] object.
 ///
 /// # Panics
 /// May panic if:
 /// - Getting the `OrtApi` struct fails, due to `ort` loading an unsupported version of ONNX Runtime.
 /// - Loading the ONNX Runtime dynamic library fails if the `load-dynamic` feature is enabled.
-///
-/// # Examples
-/// The primary (public-facing) use case for this function is accessing APIs that do not have a corresponding safe
-/// implementation in `ort`. For example, [`GetBuildInfoString`](https://onnxruntime.ai/docs/api/c/struct_ort_api.html#a0a7dba37b0017c0ef3a0ab4e266a967d):
-///
-/// ```
-/// # use std::ffi::CStr;
-/// # fn main() -> ort::Result<()> {
-/// let api = ort::api();
-/// let build_info = unsafe { CStr::from_ptr(api.GetBuildInfoString.unwrap()()) };
-/// println!("{}", build_info.to_string_lossy());
-/// // ORT Build Info: git-branch=HEAD, git-commit-id=4573740, build type=Release, cmake cxx flags: /DWIN32 /D_WINDOWS /EHsc /EHsc /wd26812 -DEIGEN_HAS_C99_MATH -DCPUINFO_SUPPORTED
-/// # Ok(())
-/// # }
-/// ```
-///
-/// For the full list of ONNX Runtime APIs, consult the [`ort_sys::OrtApi`] struct and the [ONNX Runtime C API](https://onnxruntime.ai/docs/api/c/struct_ort_api.html).
 pub fn api() -> &'static ort_sys::OrtApi {
-	struct ApiPointer(NonNull<ort_sys::OrtApi>);
-	unsafe impl Send for ApiPointer {}
-	unsafe impl Sync for ApiPointer {}
-
-	static G_ORT_API: OnceLock<ApiPointer> = OnceLock::new();
-
+	#[cfg(feature = "alternative-backend")]
+	let ptr = G_ORT_API
+		.get()
+		.expect(
+			"attempted to use `ort` APIs before initializing a backend\nwhen the `alternative-backend` feature is enabled, `ort::set_api` must be called to configure the `OrtApi` used by the library"
+		)
+		.0;
+	#[cfg(not(feature = "alternative-backend"))]
 	let ptr = G_ORT_API
 		.get_or_init(|| {
 			#[cfg(feature = "load-dynamic")]
 			unsafe {
+				use core::cmp::Ordering;
+
 				let dylib = lib_handle();
 				let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const ort_sys::OrtApiBase> = dylib
 					.get(b"OrtGetApiBase")
 					.expect("`OrtGetApiBase` must be present in ONNX Runtime dylib");
 				let base: *const ort_sys::OrtApiBase = base_getter();
-				assert_ne!(base, ptr::null());
+				assert!(!base.is_null());
 
-				let get_version_string: extern_system_fn! { unsafe fn () -> *const c_char } =
-					(*base).GetVersionString.expect("`GetVersionString` must be present in `OrtApiBase`");
-				let version_string = get_version_string();
+				let version_string = ((*base).GetVersionString)();
 				let version_string = CStr::from_ptr(version_string).to_string_lossy();
-				tracing::info!("Loaded ONNX Runtime dylib with version '{version_string}'");
+				crate::info!("Loaded ONNX Runtime dylib with version '{version_string}'");
 
 				let lib_minor_version = version_string.split('.').nth(1).map_or(0, |x| x.parse::<u32>().unwrap_or(0));
 				match lib_minor_version.cmp(&MINOR_VERSION) {
-					std::cmp::Ordering::Less => panic!(
+					Ordering::Less => panic!(
 						"ort {} is not compatible with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.{MINOR_VERSION}.x', but got '{version_string}'",
 						env!("CARGO_PKG_VERSION"),
 						dylib_path()
 					),
-					std::cmp::Ordering::Greater => tracing::warn!(
+					Ordering::Greater => crate::warn!(
 						"ort {} may have compatibility issues with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.{MINOR_VERSION}.x', but got '{version_string}'",
 						env!("CARGO_PKG_VERSION"),
 						dylib_path()
 					),
-					std::cmp::Ordering::Equal => {}
+					Ordering::Equal => {}
 				};
-				let get_api: extern_system_fn! { unsafe fn(u32) -> *const ort_sys::OrtApi } =
-					(*base).GetApi.expect("`GetApi` must be present in `OrtApiBase`");
-				let api: *const ort_sys::OrtApi = get_api(ort_sys::ORT_API_VERSION);
+				let api: *const ort_sys::OrtApi = ((*base).GetApi)(ort_sys::ORT_API_VERSION);
 				ApiPointer(NonNull::new(api.cast_mut()).expect("Failed to initialize ORT API"))
 			}
 			#[cfg(not(feature = "load-dynamic"))]
 			unsafe {
 				let base: *const ort_sys::OrtApiBase = ort_sys::OrtGetApiBase();
-				assert_ne!(base, ptr::null());
-				let get_api: extern_system_fn! { unsafe fn(u32) -> *const ort_sys::OrtApi } =
-					(*base).GetApi.expect("`GetApi` must be present in `OrtApiBase`");
-				let api: *const ort_sys::OrtApi = get_api(ort_sys::ORT_API_VERSION);
+				assert!(!base.is_null());
+				let api: *const ort_sys::OrtApi = ((*base).GetApi)(ort_sys::ORT_API_VERSION);
 				ApiPointer(NonNull::new(api.cast_mut()).expect("Failed to initialize ORT API"))
 			}
 		})
 		.0;
 	unsafe { ptr.as_ref() }
+}
+
+pub fn set_api(api: ort_sys::OrtApi) -> bool {
+	G_ORT_API.try_insert(ApiPointer(unsafe { NonNull::new_unchecked(Box::leak(Box::new(api))) }))
 }
 
 /// Trait to access raw pointers from safe types which wrap unsafe [`ort_sys`] types.
@@ -224,41 +210,24 @@ pub trait AsPointer {
 #[macro_export]
 macro_rules! ortsys {
 	($method:ident) => {
-		$crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))
-	};
-	($method:ident($($n:expr),+ $(,)?)) => {
-		$crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+)
+		($crate::api().$method)
 	};
 	(unsafe $method:ident($($n:expr),+ $(,)?)) => {
-		unsafe { $crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+) }
-	};
-	($method:ident($($n:expr),+ $(,)?).expect($e:expr)) => {
-		$crate::error::status_to_result($crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+)).expect($e)
+		unsafe { ($crate::api().$method)($($n),+) }
 	};
 	(unsafe $method:ident($($n:expr),+ $(,)?).expect($e:expr)) => {
-		$crate::error::status_to_result(unsafe { $crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+) }).expect($e)
-	};
-	($method:ident($($n:expr),+ $(,)?); nonNull($($check:expr),+ $(,)?)$(;)?) => {
-		$crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+);
-		$($crate::error::assert_non_null_pointer($check, stringify!($method))?;)+
+		unsafe { $crate::error::status_to_result(($crate::api().$method)($($n),+)) }.expect($e)
 	};
 	(unsafe $method:ident($($n:expr),+ $(,)?); nonNull($($check:expr),+ $(,)?)$(;)?) => {{
-		let _x = unsafe { $crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+) };
+		let _x = unsafe { ($crate::api().$method)($($n),+) };
 		$($crate::error::assert_non_null_pointer($check, stringify!($method)).unwrap();)+
 		_x
 	}};
-	($method:ident($($n:expr),+ $(,)?)?) => {
-		$crate::error::status_to_result($crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+))?;
-	};
 	(unsafe $method:ident($($n:expr),+ $(,)?)?) => {
-		$crate::error::status_to_result(unsafe { $crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+) })?;
-	};
-	($method:ident($($n:expr),+ $(,)?)?; nonNull($($check:expr),+ $(,)?)$(;)?) => {
-		$crate::error::status_to_result($crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+))?;
-		$($crate::error::assert_non_null_pointer($check, stringify!($method))?;)+
+		unsafe { $crate::error::status_to_result(($crate::api().$method)($($n),+)) }?;
 	};
 	(unsafe $method:ident($($n:expr),+ $(,)?)?; nonNull($($check:expr),+ $(,)?)$(;)?) => {{
-		$crate::error::status_to_result(unsafe { $crate::api().$method.unwrap_or_else(|| unreachable!(concat!("Method `", stringify!($method), "` is null")))($($n),+) })?;
+		unsafe { $crate::error::status_to_result(($crate::api().$method)($($n),+)) }?;
 		$($crate::error::assert_non_null_pointer($check, stringify!($method))?;)+
 	}};
 }
@@ -268,32 +237,12 @@ pub(crate) fn char_p_to_string(raw: *const c_char) -> Result<String> {
 		return Ok(String::new());
 	}
 	let c_string = unsafe { CStr::from_ptr(raw.cast_mut()).to_owned() };
-	Ok(c_string.to_string_lossy().to_string())
+	Ok(c_string.to_string_lossy().into())
 }
-
-pub(crate) struct PrivateTraitMarker;
-
-macro_rules! private_trait {
-	() => {
-		#[doc(hidden)]
-		#[allow(private_interfaces)]
-		fn _private() -> crate::PrivateTraitMarker;
-	};
-}
-macro_rules! private_impl {
-	() => {
-		#[allow(private_interfaces)]
-		fn _private() -> crate::PrivateTraitMarker {
-			crate::PrivateTraitMarker
-		}
-	};
-}
-pub(crate) use private_impl;
-pub(crate) use private_trait;
 
 #[cfg(test)]
 mod test {
-	use std::ffi::CString;
+	use alloc::ffi::CString;
 
 	use super::*;
 

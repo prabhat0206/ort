@@ -1,10 +1,12 @@
+#[cfg(feature = "download-binaries")]
+use std::fs;
 use std::{
-	env, fs,
+	env,
 	path::{Path, PathBuf}
 };
 
 #[allow(unused)]
-const ONNXRUNTIME_VERSION: &str = "1.20.0";
+const ONNXRUNTIME_VERSION: &str = "1.20.2";
 
 const ORT_ENV_SYSTEM_LIB_LOCATION: &str = "ORT_LIB_LOCATION";
 const ORT_ENV_SYSTEM_LIB_PROFILE: &str = "ORT_LIB_PROFILE";
@@ -14,35 +16,45 @@ const ENV_CXXSTDLIB: &str = "CXXSTDLIB"; // Used by the `cc` crate - we should m
 #[cfg(feature = "download-binaries")]
 const ORT_EXTRACT_DIR: &str = "onnxruntime";
 
+#[cfg(feature = "download-binaries")]
 const DIST_TABLE: &str = include_str!("dist.txt");
 
-#[path = "src/internal/dirs.rs"]
-mod dirs;
-use self::dirs::cache_dir;
+#[path = "src/internal/mod.rs"]
+#[cfg(feature = "download-binaries")]
+mod internal;
+#[cfg(feature = "download-binaries")]
+use self::internal::dirs::cache_dir;
 
 #[cfg(feature = "download-binaries")]
 fn fetch_file(source_url: &str) -> Vec<u8> {
-	let resp = ureq::AgentBuilder::new()
-		.try_proxy_from_env(true)
-		.build()
-		.get(source_url)
-		.timeout(std::time::Duration::from_secs(1800))
-		.call()
-		.unwrap_or_else(|err| panic!("Failed to GET `{source_url}`: {err}"));
+	let resp = ureq::Agent::new_with_config(
+		ureq::config::Config::builder()
+			.proxy(ureq::Proxy::try_from_env())
+			.max_redirects(0)
+			.https_only(true)
+			.tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+			.user_agent(format!(
+				"{}/{} (host {}; for {})",
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				std::env::var("HOST").unwrap(),
+				std::env::var("TARGET").unwrap()
+			))
+			.timeout_global(Some(std::time::Duration::from_secs(1800)))
+			.build()
+	)
+	.get(source_url)
+	.call()
+	.unwrap_or_else(|err| panic!("Failed to GET `{source_url}`: {err}"));
 
-	let len = resp
-		.header("Content-Length")
-		.and_then(|s| s.parse::<usize>().ok())
-		.expect("Content-Length header should be present on archive response");
-	let mut reader = resp.into_reader();
-	let mut buffer = Vec::new();
-	reader
-		.read_to_end(&mut buffer)
-		.unwrap_or_else(|err| panic!("Failed to download from `{source_url}`: {err}"));
-	assert_eq!(buffer.len(), len);
-	buffer
+	resp.into_body()
+		.into_with_config()
+		.limit(1_073_741_824)
+		.read_to_vec()
+		.unwrap_or_else(|err| panic!("Failed to download from `{source_url}`: {err}"))
 }
 
+#[cfg(feature = "download-binaries")]
 fn find_dist(target: &str, feature_set: &str) -> Option<(&'static str, &'static str)> {
 	DIST_TABLE
 		.split('\n')
@@ -63,7 +75,7 @@ fn hex_str_to_bytes(c: impl AsRef<[u8]>) -> Vec<u8> {
 		}
 	}
 
-	c.as_ref().chunks(2).map(|n| nibble(n[0]) << 4 | nibble(n[1])).collect()
+	c.as_ref().chunks(2).map(|n| (nibble(n[0]) << 4) | nibble(n[1])).collect()
 }
 
 #[cfg(feature = "download-binaries")]
@@ -91,18 +103,18 @@ fn copy_libraries(lib_dir: &Path, out_dir: &Path) {
 
 		let lib_files = std::fs::read_dir(lib_dir).unwrap_or_else(|_| panic!("Failed to read contents of `{}` (does it exist?)", lib_dir.display()));
 		for lib_file in lib_files.filter(|e| {
-			e.as_ref().ok().map_or(false, |e| {
-				e.file_type().map_or(false, |e| !e.is_dir()) && [".dll", ".so", ".dylib"].into_iter().any(|v| e.path().to_string_lossy().contains(v))
+			e.as_ref().ok().is_some_and(|e| {
+				e.file_type().is_ok_and(|e| !e.is_dir()) && [".dll", ".so", ".dylib"].into_iter().any(|v| e.path().to_string_lossy().contains(v))
 			})
 		}) {
 			let lib_file = lib_file.unwrap();
 			let lib_path = lib_file.path();
 			let lib_name = lib_path.file_name().unwrap();
 			let out_path = out_dir.join(lib_name);
+			if out_path.is_symlink() {
+				fs::remove_file(&out_path).unwrap();
+			}
 			if !out_path.exists() {
-				if out_path.is_symlink() {
-					fs::remove_file(&out_path).unwrap();
-				}
 				#[cfg(windows)]
 				if std::os::windows::fs::symlink_file(&lib_path, &out_path).is_err() {
 					copy_fallback = true;
@@ -419,6 +431,10 @@ fn prepare_libort_dir() -> (PathBuf, bool) {
 	} else {
 		#[cfg(feature = "download-binaries")]
 		{
+			if env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true") {
+				return (PathBuf::default(), true);
+			}
+
 			let target = env::var("TARGET").unwrap().to_string();
 
 			let mut feature_set = Vec::new();
@@ -450,20 +466,39 @@ fn prepare_libort_dir() -> (PathBuf, bool) {
 
 			let (prebuilt_url, prebuilt_hash) = dist.unwrap();
 
-			let mut cache_dir = cache_dir()
+			let bin_extract_dir = cache_dir()
 				.expect("could not determine cache directory")
 				.join("dfbin")
 				.join(target)
 				.join(prebuilt_hash);
-			if fs::create_dir_all(&cache_dir).is_err() {
-				cache_dir = env::var("OUT_DIR").unwrap().into();
-			}
 
-			let lib_dir = cache_dir.join(ORT_EXTRACT_DIR);
+			let lib_dir = bin_extract_dir.join(ORT_EXTRACT_DIR);
 			if !lib_dir.exists() {
 				let downloaded_file = fetch_file(prebuilt_url);
 				assert!(verify_file(&downloaded_file, prebuilt_hash), "hash of downloaded ONNX Runtime binary does not match!");
-				extract_tgz(&downloaded_file, &cache_dir);
+
+				let mut temp_extract_dir = bin_extract_dir
+					.parent()
+					.unwrap()
+					.join(format!("tmp.{}_{prebuilt_hash}", self::internal::random_identifier()));
+				let mut should_rename = true;
+				if fs::create_dir_all(&temp_extract_dir).is_err() {
+					temp_extract_dir = env::var("OUT_DIR").unwrap().into();
+					should_rename = false;
+				}
+				extract_tgz(&downloaded_file, &temp_extract_dir);
+				if should_rename {
+					match std::fs::rename(&temp_extract_dir, &bin_extract_dir) {
+						Ok(()) => {}
+						Err(e) => {
+							if bin_extract_dir.exists() {
+								let _ = fs::remove_dir_all(temp_extract_dir);
+							} else {
+								panic!("failed to extract downloaded binaries: {e}");
+							}
+						}
+					}
+				}
 			}
 
 			static_link_prerequisites(true);
@@ -544,7 +579,10 @@ fn real_main(link: bool) {
 }
 
 fn main() {
-	if env::var("DOCS_RS").is_ok() {
+	if env::var("DOCS_RS").is_ok() || cfg!(feature = "disable-linking") {
+		// On docs.rs, A) we don't need to link, and B) we don't have network, so we couldn't download anything if we wanted to.
+		// If `disable-linking` is specified, presumably the application will configure a custom backend, and the crate
+		// providing said backend will have its own linking logic, so no need to do anything.
 		return;
 	}
 

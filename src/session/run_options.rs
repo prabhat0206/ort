@@ -1,9 +1,9 @@
-use std::{
-	collections::HashMap,
-	ffi::{CStr, CString, c_char},
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
+use core::{
+	ffi::{CStr, c_char},
 	marker::PhantomData,
-	ptr::{self, NonNull},
-	sync::Arc
+	mem,
+	ptr::{self, NonNull}
 };
 
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
 	error::Result,
 	ortsys,
 	session::Output,
+	util::MiniMap,
 	value::{DynValue, Value, ValueTypeMarker}
 };
 
@@ -21,7 +22,7 @@ use crate::{
 /// # use std::sync::Arc;
 /// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
 /// # fn main() -> ort::Result<()> {
-/// let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 /// let input = Tensor::<f32>::new(&Allocator::default(), [1, 64, 64, 3])?;
 ///
 /// let output0 = session.outputs[0].name.as_str();
@@ -35,7 +36,7 @@ use crate::{
 /// );
 ///
 /// // `outputs[0]` will be the tensor we just pre-allocated.
-/// let outputs = session.run_with_options(ort::inputs![input]?, &options)?;
+/// let outputs = session.run_with_options(ort::inputs![input], &options)?;
 /// # 	Ok(())
 /// # }
 /// ```
@@ -46,7 +47,7 @@ pub struct OutputSelector {
 	use_defaults: bool,
 	default_blocklist: Vec<String>,
 	allowlist: Vec<String>,
-	preallocated_outputs: HashMap<String, Value>
+	preallocated_outputs: MiniMap<String, Value>
 }
 
 impl Default for OutputSelector {
@@ -57,7 +58,7 @@ impl Default for OutputSelector {
 			use_defaults: true,
 			allowlist: Vec::new(),
 			default_blocklist: Vec::new(),
-			preallocated_outputs: HashMap::new()
+			preallocated_outputs: MiniMap::new()
 		}
 	}
 }
@@ -100,7 +101,7 @@ impl OutputSelector {
 	/// # use std::sync::Arc;
 	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
 	/// # fn main() -> ort::Result<()> {
-	/// let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+	/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// let input = Tensor::<f32>::new(&Allocator::default(), [1, 64, 64, 3])?;
 	///
 	/// let output0 = session.outputs[0].name.as_str();
@@ -108,7 +109,7 @@ impl OutputSelector {
 	/// 	OutputSelector::default().preallocate(output0, Tensor::<f32>::new(&Allocator::default(), [1, 128, 128, 3])?)
 	/// );
 	///
-	/// let outputs = session.run_with_options(ort::inputs![input]?, &options)?;
+	/// let outputs = session.run_with_options(ort::inputs![input], &options)?;
 	/// # 	Ok(())
 	/// # }
 	/// ```
@@ -178,7 +179,7 @@ unsafe impl Sync for RunOptions<NoSelectedOutputs> {}
 impl RunOptions {
 	/// Creates a new [`RunOptions`] struct.
 	pub fn new() -> Result<RunOptions<NoSelectedOutputs>> {
-		let mut run_options_ptr: *mut ort_sys::OrtRunOptions = std::ptr::null_mut();
+		let mut run_options_ptr: *mut ort_sys::OrtRunOptions = ptr::null_mut();
 		ortsys![unsafe CreateRunOptions(&mut run_options_ptr)?; nonNull(run_options_ptr)];
 		Ok(RunOptions {
 			run_options_ptr: unsafe { NonNull::new_unchecked(run_options_ptr) },
@@ -198,7 +199,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// # use std::sync::Arc;
 	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, memory::Allocator, value::Tensor};
 	/// # fn main() -> ort::Result<()> {
-	/// let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+	/// let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// let input = Tensor::<f32>::new(&Allocator::default(), [1, 64, 64, 3])?;
 	///
 	/// let output0 = session.outputs[0].name.as_str();
@@ -212,13 +213,13 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// );
 	///
 	/// // `outputs[0]` will be the tensor we just pre-allocated.
-	/// let outputs = session.run_with_options(ort::inputs![input]?, &options)?;
+	/// let outputs = session.run_with_options(ort::inputs![input], &options)?;
 	/// # 	Ok(())
 	/// # }
 	/// ```
 	pub fn with_outputs(mut self, outputs: OutputSelector) -> RunOptions<HasSelectedOutputs> {
 		self.outputs = outputs;
-		unsafe { std::mem::transmute(self) }
+		unsafe { mem::transmute(self) }
 	}
 
 	/// Sets a tag to identify this run in logs.
@@ -253,7 +254,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// # use std::sync::Arc;
 	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, value::Value};
 	/// # fn main() -> ort::Result<()> {
-	/// # 	let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+	/// # 	let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// # 	let input = Value::from_array(ndarray::Array4::<f32>::zeros((1, 64, 64, 3)))?;
 	/// let run_options = Arc::new(RunOptions::new()?);
 	///
@@ -262,7 +263,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// 	let _ = run_options_.terminate();
 	/// });
 	///
-	/// let res = session.run_with_options(ort::inputs![input]?, &*run_options);
+	/// let res = session.run_with_options(ort::inputs![input], &*run_options);
 	/// // upon termination, the session will return an `Error::SessionRun` error.`
 	/// assert_eq!(
 	/// 	&res.unwrap_err().to_string(),
@@ -282,7 +283,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// # use std::sync::Arc;
 	/// # use ort::{session::{Session, run_options::{RunOptions, OutputSelector}}, value::Value};
 	/// # fn main() -> ort::Result<()> {
-	/// # 	let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+	/// # 	let mut session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
 	/// # 	let input = Value::from_array(ndarray::Array4::<f32>::zeros((1, 64, 64, 3)))?;
 	/// let run_options = Arc::new(RunOptions::new()?);
 	///
@@ -293,7 +294,7 @@ impl<O: SelectedOutputMarker> RunOptions<O> {
 	/// 	let _ = run_options_.unterminate();
 	/// });
 	///
-	/// let res = session.run_with_options(ort::inputs![input]?, &*run_options);
+	/// let res = session.run_with_options(ort::inputs![input], &*run_options);
 	/// assert!(res.is_ok());
 	/// # 	Ok(())
 	/// # }

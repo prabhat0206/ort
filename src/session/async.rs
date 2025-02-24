@@ -1,15 +1,15 @@
-use std::{
+use alloc::{ffi::CString, sync::Arc};
+use core::{
 	cell::UnsafeCell,
-	ffi::{CString, c_char},
+	ffi::{c_char, c_void},
 	future::Future,
+	marker::PhantomData,
 	ops::Deref,
 	pin::Pin,
 	ptr::NonNull,
-	sync::{Arc, Mutex},
 	task::{Context, Poll, Waker}
 };
-
-use ort_sys::{OrtStatus, c_void};
+use std::sync::Mutex;
 
 use crate::{
 	error::Result,
@@ -81,23 +81,25 @@ impl<O: SelectedOutputMarker> Deref for RunOptionsRef<'_, O> {
 	}
 }
 
-pub struct InferenceFut<'s, 'r, O: SelectedOutputMarker> {
+pub struct InferenceFut<'s, 'r, 'v, O: SelectedOutputMarker> {
 	inner: Arc<InferenceFutInner<'r, 's>>,
 	run_options: RunOptionsRef<'r, O>,
-	did_receive: bool
+	did_receive: bool,
+	_inputs: PhantomData<&'v ()>
 }
 
-impl<'s, 'r, O: SelectedOutputMarker> InferenceFut<'s, 'r, O> {
+impl<'s, 'r, O: SelectedOutputMarker> InferenceFut<'s, 'r, '_, O> {
 	pub(crate) fn new(inner: Arc<InferenceFutInner<'r, 's>>, run_options: RunOptionsRef<'r, O>) -> Self {
 		Self {
 			inner,
 			run_options,
-			did_receive: false
+			did_receive: false,
+			_inputs: PhantomData
 		}
 	}
 }
 
-impl<'s, 'r, O: SelectedOutputMarker> Future for InferenceFut<'s, 'r, O> {
+impl<'s, 'r, O: SelectedOutputMarker> Future for InferenceFut<'s, 'r, '_, O> {
 	type Output = Result<SessionOutputs<'r, 's>>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -113,7 +115,7 @@ impl<'s, 'r, O: SelectedOutputMarker> Future for InferenceFut<'s, 'r, O> {
 	}
 }
 
-impl<O: SelectedOutputMarker> Drop for InferenceFut<'_, '_, O> {
+impl<O: SelectedOutputMarker> Drop for InferenceFut<'_, '_, '_, O> {
 	fn drop(&mut self) {
 		if !self.did_receive {
 			let _ = self.run_options.terminate();
@@ -122,9 +124,9 @@ impl<O: SelectedOutputMarker> Drop for InferenceFut<'_, '_, O> {
 	}
 }
 
-pub(crate) struct AsyncInferenceContext<'r, 's> {
+pub(crate) struct AsyncInferenceContext<'r, 's, 'v> {
 	pub(crate) inner: Arc<InferenceFutInner<'r, 's>>,
-	pub(crate) _input_values: Vec<SessionInputValue<'s>>,
+	pub(crate) _input_values: Vec<SessionInputValue<'v>>,
 	pub(crate) input_ort_values: Vec<*const ort_sys::OrtValue>,
 	pub(crate) input_name_ptrs: Vec<*const c_char>,
 	pub(crate) output_name_ptrs: Vec<*const c_char>,
@@ -133,30 +135,28 @@ pub(crate) struct AsyncInferenceContext<'r, 's> {
 	pub(crate) output_value_ptrs: Vec<*mut ort_sys::OrtValue>
 }
 
-crate::extern_system_fn! {
-	pub(crate) fn async_callback(user_data: *mut c_void, _: *mut *mut ort_sys::OrtValue, _: usize, status: *mut OrtStatus) {
-		let ctx = unsafe { Box::from_raw(user_data.cast::<AsyncInferenceContext<'_, '_>>()) };
+pub(crate) extern "system" fn async_callback(user_data: *mut c_void, _: *mut *mut ort_sys::OrtValue, _: usize, status: ort_sys::OrtStatusPtr) {
+	let ctx = unsafe { Box::from_raw(user_data.cast::<AsyncInferenceContext<'_, '_, '_>>()) };
 
-		// Reconvert name ptrs to CString so drop impl is called and memory is freed
-		for p in ctx.input_name_ptrs {
-			drop(unsafe { CString::from_raw(p.cast_mut().cast()) });
-		}
-
-		if let Err(e) = crate::error::status_to_result(status) {
-			ctx.inner.emplace_value(Err(e));
-			ctx.inner.wake();
-			return;
-		}
-
-		let outputs: Vec<Value> = ctx
-			.output_value_ptrs
-			.into_iter()
-			.map(|tensor_ptr| unsafe {
-				Value::from_ptr(NonNull::new(tensor_ptr).expect("OrtValue ptr returned from session Run should not be null"), Some(Arc::clone(ctx.session_inner)))
-			})
-			.collect();
-
-		ctx.inner.emplace_value(Ok(SessionOutputs::new(ctx.output_names, outputs)));
-		ctx.inner.wake();
+	// Reconvert name ptrs to CString so drop impl is called and memory is freed
+	for p in ctx.input_name_ptrs {
+		drop(unsafe { CString::from_raw(p.cast_mut().cast()) });
 	}
+
+	if let Err(e) = unsafe { crate::error::status_to_result(status) } {
+		ctx.inner.emplace_value(Err(e));
+		ctx.inner.wake();
+		return;
+	}
+
+	let outputs: Vec<Value> = ctx
+		.output_value_ptrs
+		.into_iter()
+		.map(|tensor_ptr| unsafe {
+			Value::from_ptr(NonNull::new(tensor_ptr).expect("OrtValue ptr returned from session Run should not be null"), Some(Arc::clone(ctx.session_inner)))
+		})
+		.collect();
+
+	ctx.inner.emplace_value(Ok(SessionOutputs::new(ctx.output_names, outputs)));
+	ctx.inner.wake();
 }

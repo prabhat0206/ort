@@ -1,10 +1,11 @@
 //! Types for managing memory & device allocations.
 
-use std::{
-	ffi::{CString, c_char, c_int, c_void},
+use alloc::sync::Arc;
+use core::{
+	ffi::{c_char, c_int, c_void},
 	mem,
-	ptr::NonNull,
-	sync::Arc
+	ptr::{self, NonNull},
+	slice, str
 };
 
 use crate::{
@@ -85,7 +86,7 @@ unsafe impl Send for Allocator {}
 impl Allocator {
 	pub(crate) unsafe fn from_raw_unchecked(ptr: *mut ort_sys::OrtAllocator) -> Allocator {
 		Allocator {
-			ptr: NonNull::new_unchecked(ptr),
+			ptr: unsafe { NonNull::new_unchecked(ptr) },
 			is_default: false,
 			// currently, this function is only ever used in session creation, where we call `CreateAllocator` manually and store the allocator resulting from
 			// this function in the `SharedSessionInner` - we don't need to hold onto the session, because the session is holding onto us.
@@ -139,7 +140,7 @@ impl Allocator {
 	/// };
 	/// ```
 	pub unsafe fn free<T>(&self, ptr: *mut T) {
-		self.ptr.as_ref().Free.unwrap_or_else(|| unreachable!("Allocator method `Free` is null"))(self.ptr.as_ptr(), ptr.cast());
+		unsafe { self.ptr.as_ref().Free.unwrap_or_else(|| unreachable!("Allocator method `Free` is null"))(self.ptr.as_ptr(), ptr.cast()) };
 	}
 
 	/// Returns the [`MemoryInfo`] describing this allocator.
@@ -151,7 +152,7 @@ impl Allocator {
 	/// Creates a new [`Allocator`] for the given session, to allocate memory on the device described in the
 	/// [`MemoryInfo`].
 	pub fn new(session: &Session, memory_info: MemoryInfo) -> Result<Self> {
-		let mut allocator_ptr: *mut ort_sys::OrtAllocator = std::ptr::null_mut();
+		let mut allocator_ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
 		ortsys![unsafe CreateAllocator(session.ptr(), memory_info.ptr.as_ptr(), &mut allocator_ptr)?; nonNull(allocator_ptr)];
 		Ok(Self {
 			ptr: unsafe { NonNull::new_unchecked(allocator_ptr) },
@@ -169,8 +170,9 @@ impl Default for Allocator {
 	/// The allocator returned by this function is actually shared across all invocations (though this behavior is
 	/// transparent to the user).
 	fn default() -> Self {
-		let mut allocator_ptr: *mut ort_sys::OrtAllocator = std::ptr::null_mut();
-		status_to_result(ortsys![unsafe GetAllocatorWithDefaultOptions(&mut allocator_ptr); nonNull(allocator_ptr)]).expect("Failed to get default allocator");
+		let mut allocator_ptr: *mut ort_sys::OrtAllocator = ptr::null_mut();
+		let res = ortsys![unsafe GetAllocatorWithDefaultOptions(&mut allocator_ptr); nonNull(allocator_ptr)];
+		unsafe { status_to_result(res) }.expect("Failed to get default allocator");
 		Self {
 			ptr: unsafe { NonNull::new_unchecked(allocator_ptr) },
 			is_default: true,
@@ -247,22 +249,22 @@ impl Drop for AllocatedBlock<'_> {
 pub struct AllocationDevice(&'static str);
 
 impl AllocationDevice {
-	pub const CPU: AllocationDevice = AllocationDevice("Cpu");
-	pub const CUDA: AllocationDevice = AllocationDevice("Cuda");
-	pub const CUDA_PINNED: AllocationDevice = AllocationDevice("CudaPinned");
-	pub const CANN: AllocationDevice = AllocationDevice("Cann");
-	pub const CANN_PINNED: AllocationDevice = AllocationDevice("CannPinned");
-	pub const DIRECTML: AllocationDevice = AllocationDevice("Dml");
-	pub const DIRECTML_CPU: AllocationDevice = AllocationDevice("DML CPU");
-	pub const HIP: AllocationDevice = AllocationDevice("Hip");
-	pub const HIP_PINNED: AllocationDevice = AllocationDevice("HipPinned");
-	pub const OPENVINO_CPU: AllocationDevice = AllocationDevice("OpenVINO_CPU");
-	pub const OPENVINO_GPU: AllocationDevice = AllocationDevice("OpenVINO_GPU");
-	pub const XNNPACK: AllocationDevice = AllocationDevice("XnnpackExecutionProvider");
-	pub const TVM: AllocationDevice = AllocationDevice("TVM");
+	pub const CPU: AllocationDevice = AllocationDevice("Cpu\0");
+	pub const CUDA: AllocationDevice = AllocationDevice("Cuda\0");
+	pub const CUDA_PINNED: AllocationDevice = AllocationDevice("CudaPinned\0");
+	pub const CANN: AllocationDevice = AllocationDevice("Cann\0");
+	pub const CANN_PINNED: AllocationDevice = AllocationDevice("CannPinned\0");
+	pub const DIRECTML: AllocationDevice = AllocationDevice("DML\0");
+	pub const DIRECTML_CPU: AllocationDevice = AllocationDevice("DML CPU\0");
+	pub const HIP: AllocationDevice = AllocationDevice("Hip\0");
+	pub const HIP_PINNED: AllocationDevice = AllocationDevice("HipPinned\0");
+	pub const OPENVINO_CPU: AllocationDevice = AllocationDevice("OpenVINO_CPU\0");
+	pub const OPENVINO_GPU: AllocationDevice = AllocationDevice("OpenVINO_GPU\0");
+	pub const XNNPACK: AllocationDevice = AllocationDevice("XnnpackExecutionProvider\0");
+	pub const TVM: AllocationDevice = AllocationDevice("TVM\0");
 
 	pub fn as_str(&self) -> &'static str {
-		self.0
+		&self.0[..self.0.len() - 1]
 	}
 }
 
@@ -388,10 +390,9 @@ impl MemoryInfo {
 	/// # }
 	/// ```
 	pub fn new(allocation_device: AllocationDevice, device_id: c_int, allocator_type: AllocatorType, memory_type: MemoryType) -> Result<Self> {
-		let mut memory_info_ptr: *mut ort_sys::OrtMemoryInfo = std::ptr::null_mut();
-		let allocator_name = CString::new(allocation_device.as_str()).unwrap_or_else(|_| unreachable!());
+		let mut memory_info_ptr: *mut ort_sys::OrtMemoryInfo = ptr::null_mut();
 		ortsys![
-			unsafe CreateMemoryInfo(allocator_name.as_ptr(), allocator_type.into(), device_id, memory_type.into(), &mut memory_info_ptr)?;
+			unsafe CreateMemoryInfo(allocation_device.as_str().as_ptr().cast(), allocator_type.into(), device_id, memory_type.into(), &mut memory_info_ptr)?;
 			nonNull(memory_info_ptr)
 		];
 		Ok(Self {
@@ -402,11 +403,11 @@ impl MemoryInfo {
 
 	pub(crate) fn from_value(value_ptr: *mut ort_sys::OrtValue) -> Option<Self> {
 		let mut is_tensor = 0;
-		ortsys![unsafe IsTensor(value_ptr, &mut is_tensor)]; // infallible
+		ortsys![unsafe IsTensor(value_ptr, &mut is_tensor).expect("infallible")];
 		if is_tensor != 0 {
-			let mut memory_info_ptr: *const ort_sys::OrtMemoryInfo = std::ptr::null_mut();
+			let mut memory_info_ptr: *const ort_sys::OrtMemoryInfo = ptr::null_mut();
 			// infallible, and `memory_info_ptr` will never be null
-			ortsys![unsafe GetTensorMemoryInfo(value_ptr, &mut memory_info_ptr)];
+			ortsys![unsafe GetTensorMemoryInfo(value_ptr, &mut memory_info_ptr).expect("infallible")];
 			Some(Self::from_raw(unsafe { NonNull::new_unchecked(memory_info_ptr.cast_mut()) }, false))
 		} else {
 			None
@@ -419,7 +420,7 @@ impl MemoryInfo {
 
 	// All getter functions are (at least currently) infallible - they simply just dereference the corresponding fields,
 	// and always return `nullptr` for the status; so none of these have to return `Result`s.
-	// https://github.com/microsoft/onnxruntime/blob/v1.20.0/onnxruntime/core/framework/allocator.cc#L167
+	// https://github.com/microsoft/onnxruntime/blob/v1.20.2/onnxruntime/core/framework/allocator.cc#L171
 
 	/// Returns the [`MemoryType`] described by this struct.
 	/// ```
@@ -432,7 +433,7 @@ impl MemoryInfo {
 	/// ```
 	pub fn memory_type(&self) -> MemoryType {
 		let mut raw_type: ort_sys::OrtMemType = ort_sys::OrtMemType::OrtMemTypeDefault;
-		ortsys![unsafe MemoryInfoGetMemType(self.ptr.as_ptr(), &mut raw_type)];
+		ortsys![unsafe MemoryInfoGetMemType(self.ptr.as_ptr(), &mut raw_type).expect("infallible")];
 		MemoryType::from(raw_type)
 	}
 
@@ -447,7 +448,7 @@ impl MemoryInfo {
 	/// ```
 	pub fn allocator_type(&self) -> AllocatorType {
 		let mut raw_type: ort_sys::OrtAllocatorType = ort_sys::OrtAllocatorType::OrtInvalidAllocator;
-		ortsys![unsafe MemoryInfoGetType(self.ptr.as_ptr(), &mut raw_type)];
+		ortsys![unsafe MemoryInfoGetType(self.ptr.as_ptr(), &mut raw_type).expect("infallible")];
 		match raw_type {
 			ort_sys::OrtAllocatorType::OrtArenaAllocator => AllocatorType::Arena,
 			ort_sys::OrtAllocatorType::OrtDeviceAllocator => AllocatorType::Device,
@@ -465,11 +466,11 @@ impl MemoryInfo {
 	/// # }
 	/// ```
 	pub fn allocation_device(&self) -> AllocationDevice {
-		let mut name_ptr: *const c_char = std::ptr::null_mut();
-		ortsys![unsafe MemoryInfoGetName(self.ptr.as_ptr(), &mut name_ptr)];
+		let mut name_ptr: *const c_char = ptr::null_mut();
+		ortsys![unsafe MemoryInfoGetName(self.ptr.as_ptr(), &mut name_ptr).expect("infallible")];
 
 		// SAFETY: `name_ptr` can never be null - `CreateMemoryInfo` internally checks against builtin device names, erroring
-		// if a non-builtin device is passed, and ONNX Runtime will never supply a pointer to the C++ constructor
+		// if a non-builtin device is passed
 
 		let mut len = 0;
 		while unsafe { *name_ptr.add(len) } != 0x00 {
@@ -478,7 +479,7 @@ impl MemoryInfo {
 
 		// SAFETY: ONNX Runtime internally only ever defines allocation device names as ASCII. can't wait for this to blow up
 		// one day regardless
-		let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr.cast::<u8>(), len)) };
+		let name = unsafe { str::from_utf8_unchecked(slice::from_raw_parts(name_ptr.cast::<u8>(), len + 1)) };
 		AllocationDevice(name)
 	}
 
@@ -493,7 +494,7 @@ impl MemoryInfo {
 	/// ```
 	pub fn device_id(&self) -> i32 {
 		let mut raw: ort_sys::c_int = 0;
-		ortsys![unsafe MemoryInfoGetId(self.ptr.as_ptr(), &mut raw)];
+		ortsys![unsafe MemoryInfoGetId(self.ptr.as_ptr(), &mut raw).expect("infallible")];
 		raw as _
 	}
 
@@ -520,7 +521,7 @@ impl Clone for MemoryInfo {
 impl PartialEq<MemoryInfo> for MemoryInfo {
 	fn eq(&self, other: &MemoryInfo) -> bool {
 		let mut out = 0;
-		ortsys![unsafe CompareMemoryInfo(self.ptr.as_ptr(), other.ptr.as_ptr(), &mut out)]; // implementation always returns ok status
+		ortsys![unsafe CompareMemoryInfo(self.ptr.as_ptr(), other.ptr.as_ptr(), &mut out).expect("infallible")]; // implementation always returns ok status
 		out == 0
 	}
 }

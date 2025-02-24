@@ -4,7 +4,10 @@ use std::{path::Path, time::Instant};
 use anyhow::Result;
 use image::DynamicImage;
 use ndarray::{Array, Array2, Array3, Array4, ArrayView, Ix3, Ix4, s};
-use ort::{session::Session, value::Tensor};
+use ort::{
+	session::Session,
+	value::{Tensor, TensorRef}
+};
 use tokenizers::Tokenizer;
 
 const VISION_MODEL_NAME: &str = "phi-3-v-128k-instruct-vision.onnx";
@@ -21,7 +24,7 @@ fn get_current_time() -> Instant {
 	Instant::now()
 }
 
-fn get_image_embedding(vision_model: &Session, img: &Option<DynamicImage>) -> Result<Array3<f32>> {
+fn get_image_embedding(vision_model: &mut Session, img: &Option<DynamicImage>) -> Result<Array3<f32>> {
 	let visual_features = if let Some(img) = img {
 		let image_processor = image_process::Phi3VImageProcessor::new();
 		let result = image_processor.preprocess(img)?;
@@ -31,11 +34,10 @@ fn get_image_embedding(vision_model: &Session, img: &Option<DynamicImage>) -> Re
 			pixel_values = result.pixel_values.shape(),
 			image_sizes = result.image_sizes.shape(),
 		);
-		let model_inputs = ort::inputs![
-			"pixel_values" => result.pixel_values,
-			"image_sizes" => result.image_sizes,
-		]?;
-		let outputs = vision_model.run(model_inputs)?;
+		let outputs = vision_model.run(ort::inputs![
+			"pixel_values" => Tensor::from_array(result.pixel_values)?,
+			"image_sizes" => Tensor::from_array(result.image_sizes)?,
+		])?;
 		let predictions_view: ArrayView<f32, _> = outputs["visual_features"].try_extract_tensor::<f32>()?;
 		predictions_view.into_dimensionality::<Ix3>()?.to_owned()
 	} else {
@@ -44,11 +46,10 @@ fn get_image_embedding(vision_model: &Session, img: &Option<DynamicImage>) -> Re
 	Ok(visual_features)
 }
 
-fn get_text_embedding(text_embedding_model: &Session, input_ids: &Array2<i64>) -> Result<Array3<f32>> {
-	let model_inputs = ort::inputs![
-		"input_ids" => input_ids.to_owned(),
-	]?;
-	let outputs = text_embedding_model.run(model_inputs)?;
+fn get_text_embedding(text_embedding_model: &mut Session, input_ids: &Array2<i64>) -> Result<Array3<f32>> {
+	let outputs = text_embedding_model.run(ort::inputs![
+		"input_ids" => TensorRef::from_array_view(input_ids)?,
+	])?;
 	let inputs_embeds_view: ArrayView<f32, _> = outputs["inputs_embeds"].try_extract_tensor::<f32>()?;
 	let inputs_embeds = inputs_embeds_view.into_dimensionality::<Ix3>()?.to_owned();
 	Ok(inputs_embeds)
@@ -101,9 +102,9 @@ fn format_chat_template(img: &Option<DynamicImage>, txt: &str) -> String {
 
 pub async fn generate_text(
 	tokenizer: &Tokenizer,
-	vision_model: &Session,
-	text_embedding_model: &Session,
-	generation_model: &Session,
+	vision_model: &mut Session,
+	text_embedding_model: &mut Session,
+	generation_model: &mut Session,
 	image: &Option<DynamicImage>,
 	text: &str
 ) -> Result<()> {
@@ -144,12 +145,12 @@ pub async fn generate_text(
 		// Prepare model inputs
 		let model_inputs = {
 			let mut model_inputs = ort::inputs![
-				"inputs_embeds" => next_inputs_embeds.clone(),
-				"attention_mask" => attention_mask.clone(),
-			]?;
+				"inputs_embeds" => TensorRef::from_array_view(&next_inputs_embeds)?,
+				"attention_mask" => TensorRef::from_array_view(&attention_mask)?,
+			];
 			for i in 0..32 {
-				model_inputs.push((format!("past_key_values.{}.key", i).into(), Tensor::from_array(past_key_values[i * 2].view())?.into()));
-				model_inputs.push((format!("past_key_values.{}.value", i).into(), Tensor::from_array(past_key_values[i * 2 + 1].view())?.into()));
+				model_inputs.push((format!("past_key_values.{}.key", i).into(), TensorRef::from_array_view(&past_key_values[i * 2])?.into()));
+				model_inputs.push((format!("past_key_values.{}.value", i).into(), TensorRef::from_array_view(&past_key_values[i * 2 + 1])?.into()));
 			}
 			model_inputs
 		};
@@ -212,19 +213,19 @@ async fn main() -> Result<()> {
 
 	let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
 	let tokenizer = Tokenizer::from_file(data_dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("Error loading tokenizer: {:?}", e))?;
-	let vision_model = Session::builder()?.commit_from_file(data_dir.join(VISION_MODEL_NAME))?;
-	let text_embedding_model = Session::builder()?.commit_from_file(data_dir.join(TEXT_EMBEDDING_MODEL_NAME))?;
-	let generation_model = Session::builder()?.commit_from_file(data_dir.join(GENERATION_MODEL_NAME))?;
+	let mut vision_model = Session::builder()?.commit_from_file(data_dir.join(VISION_MODEL_NAME))?;
+	let mut text_embedding_model = Session::builder()?.commit_from_file(data_dir.join(TEXT_EMBEDDING_MODEL_NAME))?;
+	let mut generation_model = Session::builder()?.commit_from_file(data_dir.join(GENERATION_MODEL_NAME))?;
 
 	// Generate text from text
 	let image: Option<DynamicImage> = None;
 	let text = "Who are you?".to_string();
-	generate_text(&tokenizer, &vision_model, &text_embedding_model, &generation_model, &image, &text).await?;
+	generate_text(&tokenizer, &mut vision_model, &mut text_embedding_model, &mut generation_model, &image, &text).await?;
 
 	// Generate text from image and text
 	let image: Option<DynamicImage> = Some(image::open(data_dir.join("example.jpg"))?);
 	let text = "What is shown in this image?".to_string();
-	generate_text(&tokenizer, &vision_model, &text_embedding_model, &generation_model, &image, &text).await?;
+	generate_text(&tokenizer, &mut vision_model, &mut text_embedding_model, &mut generation_model, &image, &text).await?;
 
 	Ok(())
 }

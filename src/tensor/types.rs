@@ -1,6 +1,7 @@
-use std::fmt;
+use alloc::string::String;
+use core::fmt;
 #[cfg(feature = "ndarray")]
-use std::ptr;
+use core::{ffi::c_void, ptr};
 
 #[cfg(feature = "ndarray")]
 use crate::{error::Result, ortsys};
@@ -40,6 +41,29 @@ pub enum TensorElementType {
 	#[cfg(feature = "half")]
 	#[cfg_attr(docsrs, doc(cfg(feature = "half")))]
 	Bfloat16
+}
+
+impl TensorElementType {
+	pub fn size(&self) -> usize {
+		match self {
+			TensorElementType::Bool => 1,
+			#[cfg(feature = "half")]
+			TensorElementType::Bfloat16 => 2,
+			#[cfg(feature = "half")]
+			TensorElementType::Float16 => 2,
+			TensorElementType::Float32 => 4,
+			TensorElementType::Float64 => 8,
+			TensorElementType::Int16 => 2,
+			TensorElementType::Int32 => 4,
+			TensorElementType::Int64 => 8,
+			TensorElementType::Int8 => 1,
+			TensorElementType::String => 0,
+			TensorElementType::Uint16 => 2,
+			TensorElementType::Uint32 => 4,
+			TensorElementType::Uint64 => 8,
+			TensorElementType::Uint8 => 1
+		}
+	}
 }
 
 impl fmt::Display for TensorElementType {
@@ -116,13 +140,13 @@ pub trait IntoTensorElementType {
 	/// Returns the ONNX tensor element data type corresponding to the given Rust type.
 	fn into_tensor_element_type() -> TensorElementType;
 
-	crate::private_trait!();
+	private_trait!();
 }
 
 /// A superset of [`IntoTensorElementType`] that represents traits whose underlying memory is identical between Rust and
 /// C++ (i.e., every type except `String`).
 pub trait PrimitiveTensorElementType: IntoTensorElementType {
-	crate::private_trait!();
+	private_trait!();
 }
 
 macro_rules! impl_type_trait {
@@ -132,11 +156,11 @@ macro_rules! impl_type_trait {
 				TensorElementType::$variant
 			}
 
-			crate::private_impl!();
+			private_impl!();
 		}
 
 		impl PrimitiveTensorElementType for $type_ {
-			crate::private_impl!();
+			private_impl!();
 		}
 	};
 }
@@ -164,7 +188,7 @@ impl IntoTensorElementType for String {
 		TensorElementType::String
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 
 /// Adapter for common Rust string types to ONNX strings.
@@ -194,7 +218,7 @@ pub(crate) fn extract_primitive_array<'t, T>(shape: ndarray::IxDyn, tensor: *con
 	// Get pointer to output tensor values
 	let mut output_array_ptr: *mut T = ptr::null_mut();
 	let output_array_ptr_ptr: *mut *mut T = &mut output_array_ptr;
-	let output_array_ptr_ptr_void: *mut *mut std::ffi::c_void = output_array_ptr_ptr.cast();
+	let output_array_ptr_ptr_void: *mut *mut c_void = output_array_ptr_ptr.cast();
 	ortsys![unsafe GetTensorMutableData(tensor.cast_mut(), output_array_ptr_ptr_void)?; nonNull(output_array_ptr)];
 
 	let array_view = unsafe { ndarray::ArrayView::from_shape_ptr(shape, output_array_ptr) };
@@ -210,7 +234,7 @@ pub(crate) fn extract_primitive_array_mut<'t, T>(shape: ndarray::IxDyn, tensor: 
 	// Get pointer to output tensor values
 	let mut output_array_ptr: *mut T = ptr::null_mut();
 	let output_array_ptr_ptr: *mut *mut T = &mut output_array_ptr;
-	let output_array_ptr_ptr_void: *mut *mut std::ffi::c_void = output_array_ptr_ptr.cast();
+	let output_array_ptr_ptr_void: *mut *mut c_void = output_array_ptr_ptr.cast();
 	ortsys![unsafe GetTensorMutableData(tensor, output_array_ptr_ptr_void)?; nonNull(output_array_ptr)];
 
 	let array_view = unsafe { ndarray::ArrayViewMut::from_shape_ptr(shape, output_array_ptr) };

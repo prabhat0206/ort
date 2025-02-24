@@ -1,18 +1,32 @@
 mod create;
 mod extract;
 
-use std::{
+use alloc::{
+	format,
+	string::{String, ToString},
+	sync::Arc,
+	vec
+};
+use core::{
 	fmt::Debug,
 	marker::PhantomData,
+	mem,
 	ops::{Index, IndexMut},
-	sync::Arc
+	ptr::{self, NonNull}
 };
 
-use super::{DowncastableTarget, DynValue, Value, ValueRef, ValueRefMut, ValueType, ValueTypeMarker};
-use crate::{AsPointer, error::Result, memory::MemoryInfo, ortsys, tensor::IntoTensorElementType};
+pub use self::create::{OwnedTensorArrayData, TensorArrayData, TensorArrayDataMut, TensorArrayDataParts, ToDimensions};
+use super::{DowncastableTarget, DynValue, Value, ValueInner, ValueRef, ValueRefMut, ValueType, ValueTypeMarker};
+use crate::{
+	AsPointer,
+	error::Result,
+	memory::{Allocator, MemoryInfo},
+	ortsys,
+	tensor::{IntoTensorElementType, TensorElementType}
+};
 
 pub trait TensorValueTypeMarker: ValueTypeMarker {
-	crate::private_trait!();
+	private_trait!();
 }
 
 #[derive(Debug)]
@@ -22,10 +36,10 @@ impl ValueTypeMarker for DynTensorValueType {
 		"DynTensor".to_string()
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 impl TensorValueTypeMarker for DynTensorValueType {
-	crate::private_impl!();
+	private_impl!();
 }
 
 #[derive(Debug)]
@@ -35,10 +49,10 @@ impl<T: IntoTensorElementType + Debug> ValueTypeMarker for TensorValueType<T> {
 		format!("Tensor<{}>", T::into_tensor_element_type())
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 impl<T: IntoTensorElementType + Debug> TensorValueTypeMarker for TensorValueType<T> {
-	crate::private_impl!();
+	private_impl!();
 }
 
 /// A tensor [`Value`] whose data type is unknown.
@@ -60,7 +74,71 @@ impl DowncastableTarget for DynTensorValueType {
 		matches!(dtype, ValueType::Tensor { .. })
 	}
 
-	crate::private_impl!();
+	private_impl!();
+}
+
+impl DynTensor {
+	/// Construct a tensor via a given allocator with a given shape and datatype. The data in the tensor will be
+	/// **uninitialized**.
+	///
+	/// This can be used to create a tensor with data on a certain device. For example, to create a tensor with pinned
+	/// (CPU) memory for use with CUDA:
+	/// ```no_run
+	/// # use ort::{memory::{Allocator, MemoryInfo, MemoryType, AllocationDevice, AllocatorType}, session::Session, tensor::TensorElementType, value::DynTensor};
+	/// # fn main() -> ort::Result<()> {
+	/// # let session = Session::builder()?.commit_from_file("tests/data/upsample.onnx")?;
+	/// let allocator = Allocator::new(
+	/// 	&session,
+	/// 	MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, MemoryType::CPUInput)?
+	/// )?;
+	///
+	/// let mut img_input = DynTensor::new(&allocator, TensorElementType::Float32, [1, 128, 128, 3])?;
+	/// # Ok(())
+	/// # }
+	/// ```
+	pub fn new(allocator: &Allocator, data_type: TensorElementType, shape: impl ToDimensions) -> Result<DynTensor> {
+		let mut value_ptr: *mut ort_sys::OrtValue = ptr::null_mut();
+
+		let shape = shape.to_dimensions(None)?;
+		let shape_ptr: *const i64 = shape.as_ptr();
+		let shape_len = shape.len();
+
+		ortsys![
+			unsafe CreateTensorAsOrtValue(
+				allocator.ptr().cast_mut(),
+				shape_ptr,
+				shape_len,
+				data_type.into(),
+				&mut value_ptr
+			)?;
+			nonNull(value_ptr)
+		];
+
+		// `CreateTensorAsOrtValue` actually does not guarantee that the data allocated is zero'd out, so if we can, we should
+		// do it manually.
+		let memory_info = MemoryInfo::from_value(value_ptr).expect("CreateTensorAsOrtValue returned non-tensor");
+		if memory_info.is_cpu_accessible() && data_type != TensorElementType::String {
+			let mut buffer_ptr: *mut ort_sys::c_void = ptr::null_mut();
+			ortsys![unsafe GetTensorMutableData(value_ptr, &mut buffer_ptr)?; nonNull(buffer_ptr)];
+
+			unsafe { buffer_ptr.write_bytes(0, calculate_tensor_size(&shape) * data_type.size()) };
+		}
+
+		Ok(Value {
+			inner: Arc::new(ValueInner {
+				ptr: unsafe { NonNull::new_unchecked(value_ptr) },
+				dtype: ValueType::Tensor {
+					ty: data_type,
+					dimensions: shape,
+					dimension_symbols: vec![None; shape_len]
+				},
+				drop: true,
+				memory_info: MemoryInfo::from_value(value_ptr),
+				_backing: None
+			}),
+			_markers: PhantomData
+		})
+	}
 }
 
 impl<Type: TensorValueTypeMarker + ?Sized> Value<Type> {
@@ -87,7 +165,7 @@ impl<Type: TensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # }
 	/// ```
 	pub fn data_ptr_mut(&mut self) -> Result<*mut ort_sys::c_void> {
-		let mut buffer_ptr: *mut ort_sys::c_void = std::ptr::null_mut();
+		let mut buffer_ptr: *mut ort_sys::c_void = ptr::null_mut();
 		ortsys![unsafe GetTensorMutableData(self.ptr_mut(), &mut buffer_ptr)?; nonNull(buffer_ptr)];
 		Ok(buffer_ptr)
 	}
@@ -110,7 +188,7 @@ impl<Type: TensorValueTypeMarker + ?Sized> Value<Type> {
 	/// # }
 	/// ```
 	pub fn data_ptr(&self) -> Result<*const ort_sys::c_void> {
-		let mut buffer_ptr: *mut ort_sys::c_void = std::ptr::null_mut();
+		let mut buffer_ptr: *mut ort_sys::c_void = ptr::null_mut();
 		ortsys![unsafe GetTensorMutableData(self.ptr().cast_mut(), &mut buffer_ptr)?; nonNull(buffer_ptr)];
 		Ok(buffer_ptr)
 	}
@@ -156,7 +234,7 @@ impl<T: IntoTensorElementType + Debug> Tensor<T> {
 	/// ```
 	#[inline]
 	pub fn upcast(self) -> DynTensor {
-		unsafe { std::mem::transmute(self) }
+		unsafe { mem::transmute(self) }
 	}
 
 	/// Creates a type-erased [`DynTensorRef`] from a strongly-typed [`Tensor<T>`].
@@ -214,7 +292,7 @@ impl<T: IntoTensorElementType + Debug> DowncastableTarget for TensorValueType<T>
 		}
 	}
 
-	crate::private_impl!();
+	private_impl!();
 }
 
 impl<T: IntoTensorElementType + Debug> From<Value<TensorValueType<T>>> for DynValue {
@@ -236,7 +314,7 @@ impl<T: IntoTensorElementType + Clone + Debug, const N: usize> Index<[i64; N]> f
 			panic!("Cannot directly index a tensor which is not allocated on the CPU.");
 		}
 
-		let mut out: *mut ort_sys::c_void = std::ptr::null_mut();
+		let mut out: *mut ort_sys::c_void = ptr::null_mut();
 		ortsys![unsafe TensorAt(self.ptr().cast_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor")];
 		unsafe { &*out.cast::<T>() }
 	}
@@ -247,7 +325,7 @@ impl<T: IntoTensorElementType + Clone + Debug, const N: usize> IndexMut<[i64; N]
 			panic!("Cannot directly index a tensor which is not allocated on the CPU.");
 		}
 
-		let mut out: *mut ort_sys::c_void = std::ptr::null_mut();
+		let mut out: *mut ort_sys::c_void = ptr::null_mut();
 		ortsys![unsafe TensorAt(self.ptr_mut(), index.as_ptr(), N, &mut out).expect("Failed to index tensor")];
 		unsafe { &mut *out.cast::<T>() }
 	}
@@ -266,12 +344,17 @@ pub(crate) fn calculate_tensor_size(shape: &[i64]) -> usize {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use alloc::sync::Arc;
 
+	#[cfg(feature = "ndarray")]
 	use ndarray::{ArcArray1, Array1, CowArray};
 
 	use super::Tensor;
-	use crate::{memory::Allocator, tensor::TensorElementType, value::ValueType};
+	use crate::{
+		memory::Allocator,
+		tensor::TensorElementType,
+		value::{TensorRef, ValueType}
+	};
 
 	#[test]
 	#[cfg(feature = "ndarray")]
@@ -298,19 +381,14 @@ mod tests {
 		let v: Vec<f32> = vec![1., 2., 3., 4., 5.];
 
 		let arc1 = ArcArray1::from_vec(v.clone());
-		let mut arc2 = ArcArray1::clone(&arc1);
-		let value = Tensor::from_array(&mut arc2)?;
+		let arc2 = ArcArray1::clone(&arc1);
+		let value = TensorRef::from_array_view(arc2.clone())?;
 		drop((arc1, arc2));
 
 		assert_eq!(value.extract_raw_tensor().1, &v);
 
 		let cow = CowArray::from(Array1::from_vec(v.clone()));
-		let value = Tensor::from_array(&cow)?;
-		assert_eq!(value.extract_raw_tensor().1, &v);
-
-		let owned = Array1::from_vec(v.clone());
-		let value = Tensor::from_array(owned.view())?;
-		drop(owned);
+		let value = TensorRef::from_array_view(&cow)?;
 		assert_eq!(value.extract_raw_tensor().1, &v);
 
 		Ok(())
@@ -322,7 +400,7 @@ mod tests {
 
 		let arc = Arc::new(v.clone().into_boxed_slice());
 		let shape = vec![v.len() as i64];
-		let value = Tensor::from_array((shape, Arc::clone(&arc)))?;
+		let value = TensorRef::from_array_view((shape, Arc::clone(&arc)))?;
 		drop(arc);
 		assert_eq!(value.try_extract_raw_tensor::<f32>()?.1, &v);
 
@@ -345,7 +423,7 @@ mod tests {
 	fn test_string_tensor_raw() -> crate::Result<()> {
 		let v = vec!["hello world".to_string(), "こんにちは世界".to_string()];
 
-		let value = Tensor::from_string_array((vec![v.len() as i64], v.clone().into_boxed_slice()))?;
+		let value = Tensor::from_string_array((vec![v.len() as i64], &*v))?;
 		let (extracted_shape, extracted_view) = value.try_extract_raw_string_tensor()?;
 		assert_eq!(extracted_shape, [v.len() as i64]);
 		assert_eq!(extracted_view, v);
@@ -358,10 +436,10 @@ mod tests {
 		let v: Vec<f32> = vec![1., 2., 3., 4., 5.];
 
 		let shape = [v.len()];
-		let value_arc_box = Tensor::from_array((shape, Arc::new(v.clone().into_boxed_slice())))?;
+		let value_arc_box = TensorRef::from_array_view((shape, Arc::new(v.clone().into_boxed_slice())))?;
 		let value_box = Tensor::from_array((shape, v.clone().into_boxed_slice()))?;
 		let value_vec = Tensor::from_array((shape, v.clone()))?;
-		let value_slice = Tensor::from_array((shape, &v[..]))?;
+		let value_slice = TensorRef::from_array_view((shape, &v[..]))?;
 
 		assert_eq!(value_arc_box.extract_raw_tensor().1, &v);
 		assert_eq!(value_box.extract_raw_tensor().1, &v);

@@ -1,4 +1,5 @@
-use std::ops::BitOr;
+use alloc::{format, string::ToString};
+use core::ops::BitOr;
 
 use super::{ArbitrarilyConfigurableExecutionProvider, ExecutionProviderOptions};
 use crate::{
@@ -184,16 +185,16 @@ impl CUDAExecutionProvider {
 	/// > graph runs. Due to this, the latency associated with the first `run()` is bound to be high. Subsequent
 	/// > `run()`s only perform graph replays of the graph captured and cached in the first `run()`.
 	#[must_use]
-	pub fn with_cuda_graph(mut self) -> Self {
-		self.options.set("enable_cuda_graph", "1");
+	pub fn with_cuda_graph(mut self, enable: bool) -> Self {
+		self.options.set("enable_cuda_graph", if enable { "1" } else { "0" });
 		self
 	}
 
 	/// Whether to use strict mode in the `SkipLayerNormalization` implementation. The default and recommanded setting
 	/// is `false`. If enabled, accuracy may improve slightly, but performance may decrease.
 	#[must_use]
-	pub fn with_skip_layer_norm_strict_mode(mut self) -> Self {
-		self.options.set("enable_skip_layer_norm_strict_mode", "1");
+	pub fn with_skip_layer_norm_strict_mode(mut self, enable: bool) -> Self {
+		self.options.set("enable_skip_layer_norm_strict_mode", if enable { "1" } else { "0" });
 		self
 	}
 
@@ -207,8 +208,8 @@ impl CUDAExecutionProvider {
 	}
 
 	#[must_use]
-	pub fn with_prefer_nhwc(mut self) -> Self {
-		self.options.set("prefer_nhwc", "1");
+	pub fn with_prefer_nhwc(mut self, enable: bool) -> Self {
+		self.options.set("prefer_nhwc", if enable { "1" } else { "0" });
 		self
 	}
 
@@ -269,19 +270,24 @@ impl ExecutionProvider for CUDAExecutionProvider {
 		{
 			use crate::AsPointer;
 
-			let mut cuda_options: *mut ort_sys::OrtCUDAProviderOptionsV2 = std::ptr::null_mut();
+			let mut cuda_options: *mut ort_sys::OrtCUDAProviderOptionsV2 = core::ptr::null_mut();
 			crate::ortsys![unsafe CreateCUDAProviderOptions(&mut cuda_options)?];
 			let ffi_options = self.options.to_ffi();
-			if let Err(e) = crate::error::status_to_result(
-				crate::ortsys![unsafe UpdateCUDAProviderOptions(cuda_options, ffi_options.key_ptrs(), ffi_options.value_ptrs(), ffi_options.len())]
-			) {
+
+			let res = crate::ortsys![unsafe UpdateCUDAProviderOptions(
+				cuda_options,
+				ffi_options.key_ptrs(),
+				ffi_options.value_ptrs(),
+				ffi_options.len()
+			)];
+			if let Err(e) = unsafe { crate::error::status_to_result(res) } {
 				crate::ortsys![unsafe ReleaseCUDAProviderOptions(cuda_options)];
 				return Err(e);
 			}
 
 			let status = crate::ortsys![unsafe SessionOptionsAppendExecutionProvider_CUDA_V2(session_builder.ptr_mut(), cuda_options)];
 			crate::ortsys![unsafe ReleaseCUDAProviderOptions(cuda_options)];
-			return crate::error::status_to_result(status);
+			return unsafe { crate::error::status_to_result(status) };
 		}
 
 		Err(Error::new(format!("`{}` was not registered because its corresponding Cargo feature is not enabled.", self.as_str())))

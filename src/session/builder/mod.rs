@@ -1,15 +1,12 @@
-use std::{
+use alloc::{borrow::Cow, ffi::CString, rc::Rc, sync::Arc, vec::Vec};
+use core::{
 	any::Any,
-	borrow::Cow,
-	ffi::CString,
-	ptr::{self, NonNull},
-	rc::Rc,
-	sync::Arc
+	ptr::{self, NonNull}
 };
 
 use crate::{
 	AsPointer,
-	error::{Result, assert_non_null_pointer, status_to_result},
+	error::{Result, assert_non_null_pointer},
 	memory::MemoryInfo,
 	operator::OperatorDomain,
 	ortsys,
@@ -54,7 +51,7 @@ pub struct SessionBuilder {
 impl Clone for SessionBuilder {
 	fn clone(&self) -> Self {
 		let mut session_options_ptr = ptr::null_mut();
-		status_to_result(ortsys![unsafe CloneSessionOptions(self.ptr(), ptr::addr_of_mut!(session_options_ptr))]).expect("error cloning session options");
+		ortsys![unsafe CloneSessionOptions(self.ptr(), ptr::addr_of_mut!(session_options_ptr)).expect("error cloning session options")];
 		assert_non_null_pointer(session_options_ptr, "OrtSessionOptions").expect("Cloned session option pointer is null");
 		Self {
 			session_options_ptr: unsafe { NonNull::new_unchecked(session_options_ptr) },
@@ -89,7 +86,7 @@ impl SessionBuilder {
 	/// # }
 	/// ```
 	pub fn new() -> Result<Self> {
-		let mut session_options_ptr: *mut ort_sys::OrtSessionOptions = std::ptr::null_mut();
+		let mut session_options_ptr: *mut ort_sys::OrtSessionOptions = ptr::null_mut();
 		ortsys![unsafe CreateSessionOptions(&mut session_options_ptr)?; nonNull(session_options_ptr)];
 
 		Ok(Self {
